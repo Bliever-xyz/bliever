@@ -238,68 +238,14 @@ library LSMath {
         uint256 outcomeIndex,
         uint256 alpha
     ) internal pure returns (uint256 price) {
+        // Validate outcome index
         if (outcomeIndex >= quantities.length) revert InvalidOutcomeIndex();
-
-        // Calculate b(q) and sum of quantities
-        uint256 b = liquidityParameter(quantities, alpha);
-        uint256 sumQ = 0;
-        uint256 sumExp = 0;
-        uint256 length = quantities.length;
-
-        // First pass: calculate sumQ and sumExp
-        for (uint256 i = 0; i < length; ) {
-            uint256 qi = quantities[i];
-            sumQ += qi;
-
-            uint256 ratio = (qi * SCALE) / b;
-            uint256 expValue = exp(ratio);
-            sumExp += expValue;
-
-            unchecked {
-                ++i;
-            }
-        }
-
-        // Calculate first term: α * ln(Σ exp(qj/b))
-        uint256 lnSum = ln(sumExp);
-        uint256 term1 = (alpha * lnSum) / SCALE;
-
-        // Calculate second term components
-        // weighted_i = sumQ * exp(qi/b)
-        uint256 qi = quantities[outcomeIndex];
-        uint256 ratioI = (qi * SCALE) / b;
-        uint256 expI = exp(ratioI);
-        uint256 weightedI = (sumQ * expI) / SCALE;
-
-        // weighted_sum = Σ(qj * exp(qj/b))
-        uint256 weightedSum = 0;
-        for (uint256 i = 0; i < length; ) {
-            uint256 qj = quantities[i];
-            uint256 ratioJ = (qj * SCALE) / b;
-            uint256 expJ = exp(ratioJ);
-            uint256 product = (qj * expJ) / SCALE;
-            weightedSum += product;
-
-            unchecked {
-                ++i;
-            }
-        }
-
-        // Calculate second term: (weighted_i - weighted_sum) / (sumQ * sumExp)
-        // Note: This can be negative, but we handle it as int256 then convert
-        int256 numerator = int256(weightedI) - int256(weightedSum);
-        uint256 denominator = (sumQ * sumExp) / SCALE;
-
-        int256 term2 = (numerator * int256(SCALE)) / int256(denominator);
-
-        // Combine terms: price = term1 + term2
-        // term1 is always positive, term2 can be negative
-        int256 priceInt = int256(term1) + term2;
-
-        // Price should always be positive in valid markets
-        if (priceInt <= 0) revert ArithmeticOverflow();
-
-        price = uint256(priceInt);
+        
+        // Get all prices at once (more efficient than recalculating shared values)
+        uint256[] memory allPrices = getAllPrices(quantities, alpha);
+        
+        // Return the requested price
+        price = allPrices[outcomeIndex];
     }
 
     /// @notice Calculates prices for all outcomes simultaneously
