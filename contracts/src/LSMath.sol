@@ -577,7 +577,7 @@ library LSMath {
     /// @param quantities Array to validate
     /// @return valid True if all quantities are valid
     function validateQuantities(uint256[] memory quantities) internal pure returns (bool valid) {
-        if (quantities.length == 0) return false;
+        if (quantities.length < 2) return false;
         if (quantities.length > MAX_OUTCOMES) return false;
 
         uint256 sum = 0;
