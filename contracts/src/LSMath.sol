@@ -456,7 +456,7 @@ library LSMath {
         uint256 multiplier = SCALE;
         while (x > LN_2) {
             x -= LN_2;
-            multiplier = (multiplier * 2 * SCALE) / SCALE;
+            multiplier = multiplier * 2;
             if (multiplier < SCALE) revert ExponentialOverflow();
         }
 
