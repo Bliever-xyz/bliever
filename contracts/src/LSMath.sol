@@ -114,7 +114,7 @@ library LSMath {
     function liquidityParameter(
         uint256[] memory quantities,
         uint256 alpha
-    ) internal pure returns (uint256 b) {
+    ) internal pure returns (uint256 b, uint256 sumQ) {
         // Input validation
         if (alpha < MIN_ALPHA || alpha > MAX_ALPHA) revert InvalidAlpha();
         if (quantities.length == 0) revert EmptyQuantities();
