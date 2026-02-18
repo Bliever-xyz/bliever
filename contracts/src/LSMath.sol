@@ -616,6 +616,10 @@ library LSMath {
         uint256[] memory initialQuantities,
         uint256 alpha
     ) internal pure returns (uint256 worstCaseLoss) {
+        // Validation: arrays must have same length and not be empty
+        if (quantities.length == 0 || initialQuantities.length == 0) revert EmptyQuantities();
+        if (quantities.length != initialQuantities.length) revert ArrayLengthMismatch();
+        
         uint256 costCurrent = costFunction(quantities, alpha);
         uint256 costInitial = costFunction(initialQuantities, alpha);
 
