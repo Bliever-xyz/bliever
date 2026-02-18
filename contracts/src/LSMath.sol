@@ -87,6 +87,10 @@ library LSMath {
     /// @dev exp(MAX_EXP_INPUT) ≈ 2^256 when scaled
     uint256 internal constant MAX_EXP_INPUT = 135305999368893231589; // ~135.3 in 18-decimal
 
+    /// @notice Minimum term value for early exit in Taylor series
+    /// @dev When term contribution falls below this, further terms are negligible
+    uint256 internal constant MIN_TERM = 100;
+
     /*//////////////////////////////////////////////////////////////
                         CORE LS-LMSR FUNCTIONS
     //////////////////////////////////////////////////////////////*/
@@ -466,7 +470,7 @@ library LSMath {
             sum += term;
             
             // Early exit if term becomes negligible
-            if (term < 100) break;
+            if (term < MIN_TERM) break;
 
             unchecked {
                 ++i;
