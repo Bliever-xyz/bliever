@@ -39,6 +39,21 @@ library LSMath {
     /// @notice Thrown when arithmetic operation would overflow
     error ArithmeticOverflow();
 
+    /// @notice Thrown when multiplication would overflow
+    error MultiplicationOverflow();
+
+    /// @notice Thrown when division by zero is attempted
+    error DivisionByZero();
+
+    /// @notice Thrown when market state is invalid or inconsistent
+    error InvalidMarketState();
+
+    /// @notice Thrown when array has insufficient outcomes (need at least 2)
+    error InsufficientOutcomes();
+
+    /// @notice Thrown when array lengths don't match
+    error ArrayLengthMismatch();
+
     /// @notice Thrown when logarithm input is zero or negative
     error InvalidLogInput();
 
