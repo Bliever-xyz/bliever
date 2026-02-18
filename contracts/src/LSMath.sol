@@ -493,14 +493,9 @@ library LSMath {
     /// @param x Input in 18-decimal fixed point (must be > 0)
     /// @return result ln(x) in 18-decimal fixed point
     function ln(uint256 x) internal pure returns (uint256 result) {
-        if (x == 0) revert InvalidLogInput();
+        // ln(0) is undefined, ln(x < 1) would be negative (not supported in LS-LMSR)
+        if (x == 0 || x < SCALE) revert InvalidLogInput();
         if (x == SCALE) return 0; // ln(1) = 0
-
-        // Handle x < 1 by using ln(x) = -ln(1/x)
-        bool isLessThanOne = x < SCALE;
-        if (isLessThanOne) {
-            x = (SCALE * SCALE) / x;
-        }
 
         // Find the integer part (MSB position)
         uint256 intPart = 0;
@@ -536,13 +531,6 @@ library LSMath {
         }
 
         result = intPartContribution + fracPart;
-
-        // Apply sign if original x was < 1
-        if (isLessThanOne) {
-            // Return value should be negative, but we use uint256
-            // Caller must handle negative logarithm cases
-            revert InvalidLogInput();
-        }
     }
 
     /// @notice Multiplies two 18-decimal fixed-point numbers
