@@ -262,18 +262,16 @@ library LSMath {
         uint256 length = quantities.length;
         prices = new uint256[](length);
 
-        // Calculate b(q) and shared values
-        uint256 b = liquidityParameter(quantities, alpha);
-        uint256 sumQ = 0;
+        // Calculate b(q) and shared values (using optimized tuple return)
+        (uint256 b, uint256 sumQ) = liquidityParameter(quantities, alpha);
         uint256 sumExp = 0;
 
         // Cache exp values to avoid recalculation
         uint256[] memory expValues = new uint256[](length);
 
-        // First pass: calculate sumQ, sumExp, and cache exp values
+        // First pass: calculate sumExp and cache exp values
         for (uint256 i = 0; i < length; ) {
             uint256 qi = quantities[i];
-            sumQ += qi;
 
             uint256 ratio = (qi * SCALE) / b;
             uint256 expValue = exp(ratio);
@@ -303,6 +301,9 @@ library LSMath {
 
         // Calculate denominator (same for all outcomes)
         uint256 denominator = (sumQ * sumExp) / SCALE;
+        
+        // Explicit validation: denominator should never be zero for valid markets
+        if (denominator == 0) revert InvalidMarketState();
 
         // Second pass: calculate price for each outcome
         for (uint256 i = 0; i < length; ) {
