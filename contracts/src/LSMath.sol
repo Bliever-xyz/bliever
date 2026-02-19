@@ -486,7 +486,7 @@ library LSMath {
     /// @return result Product in 18-decimal fixed point
     function mulScale(uint256 a, uint256 b) internal pure returns (uint256 result) {
         uint256 product = a * b;
-        if (product / a != b) revert ArithmeticOverflow();
+        if (product / a != b) revert MultiplicationOverflow();
         result = product / SCALE;
     }
 
@@ -496,9 +496,9 @@ library LSMath {
     /// @param b Denominator in 18-decimal fixed point
     /// @return result Quotient in 18-decimal fixed point
     function divScale(uint256 a, uint256 b) internal pure returns (uint256 result) {
-        if (b == 0) revert ArithmeticOverflow();
+        if (b == 0) revert DivisionByZero();
         uint256 scaled = a * SCALE;
-        if (scaled / a != SCALE) revert ArithmeticOverflow();
+        if (scaled / a != SCALE) revert MultiplicationOverflow();
         result = scaled / b;
     }
 
