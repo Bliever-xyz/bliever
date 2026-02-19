@@ -174,38 +174,66 @@ library LSMath {
         uint256[] memory quantities,
         uint256 alpha
     ) internal pure returns (uint256 cost) {
-        // Calculate liquidity parameter b(q)
-        uint256 b = liquidityParameter(quantities, alpha);
+        // Calculate liquidity parameter b(q) and sumQ
+        (uint256 b, ) = liquidityParameter(quantities, alpha);
 
-        // Calculate Σ exp(qi/b)
-        uint256 sumExp = 0;
         uint256 length = quantities.length;
 
+        // CRITICAL IMPROVEMENT: Log-Sum-Exp trick to prevent overflow
+        // Standard: ln(Σ exp(xi)) can overflow when Σ exp(xi) > type(uint256).max
+        // Trick: ln(Σ exp(xi)) = m + ln(Σ exp(xi - m)) where m = max(xi)
+        // This keeps exp(xi - m) ≤ 1 for all i, preventing overflow
+        
+        // Step 1: Find maximum ratio (m = max(qi/b))
+        uint256 maxRatio = 0;
         for (uint256 i = 0; i < length; ) {
             uint256 qi = quantities[i];
-            
-            // Calculate qi/b in fixed point
-            // qi and b are both in base units, result needs to be scaled
             uint256 ratio = (qi * SCALE) / b;
+            if (ratio > maxRatio) {
+                maxRatio = ratio;
+            }
+            unchecked { ++i; }
+        }
 
-            // Calculate exp(qi/b)
-            uint256 expValue = exp(ratio);
-
-            // Accumulate sum
+        // Step 2: Calculate Σ exp(qi/b - maxRatio)
+        uint256 sumExp = 0;
+        for (uint256 i = 0; i < length; ) {
+            uint256 qi = quantities[i];
+            uint256 ratio = (qi * SCALE) / b;
+            
+            // Calculate exp(ratio - maxRatio)
+            // Since ratio ≤ maxRatio, the difference is ≤ 0
+            // exp(ratio - maxRatio) ≤ exp(0) = 1
+            uint256 shiftedRatio;
+            if (ratio >= maxRatio) {
+                shiftedRatio = ratio - maxRatio;
+            } else {
+                // For ratio < maxRatio, we need exp(negative value)
+                // exp(-x) = 1/exp(x) in fixed point: SCALE^2 / exp(x)
+                uint256 diff = maxRatio - ratio;
+                uint256 expDiff = exp(diff);
+                sumExp += (SCALE * SCALE) / expDiff;
+                unchecked { ++i; }
+                continue;
+            }
+            
+            uint256 expValue = exp(shiftedRatio);
             sumExp += expValue;
             if (sumExp < expValue) revert ArithmeticOverflow();
 
-            unchecked {
-                ++i;
-            }
+            unchecked { ++i; }
         }
 
-        // Calculate ln(Σ exp(qi/b))
-        uint256 lnSum = ln(sumExp);
+        // Explicit validation: sumExp should never be zero for valid markets
+        if (sumExp == 0) revert InvalidMarketState();
 
-        // Calculate C(q) = b * ln(Σ exp(qi/b))
-        // b is in base units, lnSum is in SCALE, so result is in base units
-        cost = (b * lnSum) / SCALE;
+        // Step 3: Calculate ln(Σ exp(qi/b)) = maxRatio + ln(sumExp)
+        uint256 lnSum = ln(sumExp);
+        uint256 adjustedLn = maxRatio + lnSum;
+
+        // Step 4: Calculate C(q) = b * ln(Σ exp(qi/b))
+        // b is in base units, adjustedLn is in SCALE, so result is in base units
+        cost = (b * adjustedLn) / SCALE;
     }
 
     /// @notice Calculates the instantaneous price for outcome i
