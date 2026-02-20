@@ -208,14 +208,19 @@ library LSMath {
             if (ratio >= maxRatio) {
                 shiftedRatio = ratio - maxRatio;
             } else {
-                // For ratio < maxRatio, we need exp(negative value)
-                // exp(-x) = 1/exp(x) in fixed point: SCALE^2 / exp(x)
-                uint256 diff = maxRatio - ratio;
-                uint256 expDiff = exp(diff);
-                sumExp += (SCALE * SCALE) / expDiff;
+               // For ratio < maxRatio, we need exp(negative value)
+               // exp(-x) = 1/exp(x) in fixed point: SCALE^2 / exp(x)
+               uint256 diff = maxRatio - ratio;
+               uint256 expDiff = exp(diff);
+               uint256 term = (SCALE * SCALE) / expDiff;
+               sumExp += term;
+            
+               // ADDED: Explicit overflow check for consistency
+               if (sumExp < term) revert ArithmeticOverflow();
+            
                 unchecked { ++i; }
                 continue;
-            }
+             }
             
             uint256 expValue = exp(shiftedRatio);
             sumExp += expValue;
