@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.31;
 
 /// @title LSMath - Liquidity-Sensitive Logarithmic Market Scoring Rule Mathematics
 /// @author LS-LMSR Protocol
@@ -121,7 +121,7 @@ library LSMath {
         if (quantities.length > MAX_OUTCOMES) revert InvalidOutcomeIndex();
 
         // Calculate sum of quantities: Σqi
-        uint256 sumQ = 0;
+        sumQ = 0;
         uint256 length = quantities.length;
         
         for (uint256 i = 0; i < length; ) {
