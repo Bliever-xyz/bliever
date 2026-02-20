@@ -406,6 +406,12 @@ library LSMath {
 
         uint256 costFrom = costFunction(quantitiesFrom, alpha);
         uint256 costTo = costFunction(quantitiesTo, alpha);
+        
+        // ADDED: Validate int256 casting bounds
+        // type(int256).max = 57896044618658097711785492504343953926634992332820282019728792003956564819967
+        if (costTo > uint256(type(int256).max) || costFrom > uint256(type(int256).max)) {
+            revert ArithmeticOverflow();
+        }
 
         tradeCost = int256(costTo) - int256(costFrom);
     }
