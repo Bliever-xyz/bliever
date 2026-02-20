@@ -294,26 +294,53 @@ library LSMath {
         (uint256 b, uint256 sumQ) = liquidityParameter(quantities, alpha);
         uint256 sumExp = 0;
 
-        // Cache exp values to avoid recalculation
-        uint256[] memory expValues = new uint256[](length);
-
-        // First pass: calculate sumExp and cache exp values
+        // STEP 1: Find maxRatio (Stabilization) - CRITICAL FIX
+        uint256 maxRatio = 0;
         for (uint256 i = 0; i < length; ) {
-            uint256 qi = quantities[i];
-
-            uint256 ratio = (qi * SCALE) / b;
-            uint256 expValue = exp(ratio);
-            expValues[i] = expValue;
-            sumExp += expValue;
-
-            unchecked {
-                ++i;
+            uint256 ratio = (quantities[i] * SCALE) / b;
+            if (ratio > maxRatio) {
+                maxRatio = ratio;
             }
+            unchecked { ++i; }
         }
 
-        // Calculate shared term: α * ln(Σ exp(qj/b))
-        uint256 lnSum = ln(sumExp);
-        uint256 alphaTerm = (alpha * lnSum) / SCALE;
+        // STEP 2: Calculate shifted exp values and sumExp with Log-Sum-Exp trick
+        uint256 sumExp = 0;
+        uint256[] memory expValues = new uint256[](length);
+    
+        for (uint256 i = 0; i < length; ) {
+            uint256 qi = quantities[i];
+            uint256 ratio = (qi * SCALE) / b;
+            uint256 expValue;
+        
+            // Apply Log-Sum-Exp: exp(ratio - maxRatio) to prevent overflow
+            if (ratio >= maxRatio) {
+                uint256 shiftedRatio = ratio - maxRatio;
+                expValue = exp(shiftedRatio);
+            } else {
+                  // For ratio < maxRatio: exp(ratio - maxRatio) = 1/exp(maxRatio - ratio)
+                  uint256 diff = maxRatio - ratio;
+                  uint256 expDiff = exp(diff);
+                  expValue = (SCALE * SCALE) / expDiff;
+            }
+        
+            expValues[i] = expValue;
+            sumExp += expValue;
+        
+            // CRITICAL: Explicit overflow check
+            if (sumExp < expValue) revert ArithmeticOverflow();
+
+             unchecked { ++i; }
+        }
+
+         // Explicit validation
+         if (sumExp == 0) revert InvalidMarketState();
+
+         // STEP 3: Adjust ln calculation for stabilization
+         // ln(Σ exp(qi/b)) = maxRatio + ln(Σ exp(qi/b - maxRatio))
+         uint256 lnSum = ln(sumExp);
+         uint256 adjustedLn = maxRatio + lnSum;
+         uint256 alphaTerm = (alpha * adjustedLn) / SCALE;
 
         // Calculate weighted sum (used for all outcomes)
         uint256 weightedSum = 0;
