@@ -1,6 +1,86 @@
+# ============================================================
+# foundry.toml — Foundry Project Configuration
+# Project: LS-LMSR Prediction Market
+# Chain:   Base (Ethereum L2)
+# ============================================================
+#
+# Quick reference:
+#   forge build                      — compile all contracts
+#   forge test                       — run all tests
+#   forge test -vvv                  — verbose output (show console2.log)
+#   forge test --match-path "test/LSMath/*"   — only LSMath tests
+#   forge test --match-test "testFuzz"        — only fuzz tests
+#   forge coverage --report summary  — line + branch coverage
+#   forge snapshot                   — generate gas snapshot
+#
+# ============================================================
+
 [profile.default]
-src = "src"
-out = "out"
+
+# ── Source layout ───────────────────────────────────────────
+# Your project uses the "contractes" folder name (keep consistent with filesystem)
+src  = "src"
+test = "test"
+out  = "out"
 libs = ["lib"]
 
-# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+# ── Compiler ────────────────────────────────────────────────
+# Lock to exact version used in LSMath.sol for deterministic builds.
+# LSMath uses `pragma solidity 0.8.31;` — do NOT change this to a range.
+solc_version = "0.8.31"
+
+# Enable the optimizer. 200 runs is a balanced default for contracts
+# that are called frequently (market contracts will call LSMath often).
+optimizer        = true
+optimizer_runs   = 200
+
+# Enable viaIR for better optimization of complex pure-function libraries.
+# Particularly useful for LSMath's Taylor series and bit-manipulation in ln().
+via_ir = true
+
+# ── EVM target ──────────────────────────────────────────────
+# Base is EVM-compatible (same opcodes as Ethereum mainnet post-merge).
+# "paris" is a safe, widely-supported EVM version.
+evm_version = "paris"
+
+# ── Remappings ──────────────────────────────────────────────
+# forge-std is installed via `forge install foundry-rs/forge-std`
+# The path below assumes the default lib/forge-std location.
+remappings = [
+    "forge-std/=lib/forge-std/src/",
+]
+
+# ── Fuzz testing ─────────────────────────────────────────────
+# LSMath is a math library — fuzz testing is critical.
+# Higher runs catch more edge cases in the AMM pricing curve.
+[fuzz]
+runs             = 1000    # 1000 fuzz inputs per testFuzz_ function
+max_test_rejects = 65536   # How many invalid inputs to skip before failing
+seed             = "0x1"   # Fixed seed → reproducible CI results
+
+# ── Invariant testing ────────────────────────────────────────
+# Reserved for future invariant tests (LP vault, market contracts).
+[invariant]
+runs             = 256
+depth            = 128
+fail_on_revert   = false   # Not all reverts indicate invariant violations
+
+# ── Gas reporting ────────────────────────────────────────────
+# Useful for tracking gas cost of LSMath functions as market logic grows.
+# Run `forge snapshot` to generate, then `forge snapshot --check` in CI.
+[profile.default.fuzz]
+# Inline override: nothing extra needed for LSMath pure functions
+
+# ── CI profile ───────────────────────────────────────────────
+# Use with: FOUNDRY_PROFILE=ci forge test
+# Faster runs for CI pipelines (fewer fuzz iterations).
+[profile.ci]
+fuzz        = { runs = 500 }
+optimizer   = true
+via_ir      = true
+
+# ── Verbose profile ───────────────────────────────────────────
+# Use with: FOUNDRY_PROFILE=verbose forge test -vvv
+# More fuzz runs for deeper local testing.
+[profile.verbose]
+fuzz        = { runs = 5000 }
