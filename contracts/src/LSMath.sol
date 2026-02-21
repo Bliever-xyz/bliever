@@ -297,7 +297,6 @@ library LSMath {
 
         // Calculate b(q) and shared values (using optimized tuple return)
         (uint256 b, uint256 sumQ) = liquidityParameter(quantities, alpha);
-        uint256 sumExp = 0;
 
         // STEP 1: Find maxRatio (Stabilization) - CRITICAL FIX
         uint256 maxRatio = 0;
