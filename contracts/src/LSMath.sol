@@ -144,7 +144,7 @@ library LSMath {
         b = (alpha * sumQ) / SCALE;
 
         // Ensure b is non-zero after scaling
-        if (b == 0) revert ZeroQuantitySum();
+        if (b == 0) b = 1; // to protect downstream pricing elasticity from division-by-zero
     }
 
     /// @notice Calculates the cost function C(q) = b(q) * ln(Σ exp(qi/b(q)))
