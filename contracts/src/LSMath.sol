@@ -184,14 +184,15 @@ library LSMath {
         // Trick: ln(Σ exp(xi)) = m + ln(Σ exp(xi - m)) where m = max(xi)
         // This keeps exp(xi - m) ≤ 1 for all i, preventing overflow
         
-        // Step 1: Find maximum ratio (m = max(qi/b))
+        // Step 1: Find maximum ratio (m = max(qi/b)) and max quantity
         uint256 maxRatio = 0;
+        uint256 maxQ = 0;
         for (uint256 i = 0; i < length; ) {
             uint256 qi = quantities[i];
+            if (qi > maxQ) maxQ = qi;
+
             uint256 ratio = (qi * SCALE) / b;
-            if (ratio > maxRatio) {
-                maxRatio = ratio;
-            }
+            if (ratio > maxRatio) maxRatio = ratio;
             unchecked { ++i; }
         }
 
@@ -239,6 +240,8 @@ library LSMath {
         // Step 4: Calculate C(q) = b * ln(Σ exp(qi/b))
         // b is in base units, adjustedLn is in SCALE, so result is in base units
         cost = (b * adjustedLn) / SCALE;
+        // Prevents fractional truncation errors in imbalanced markets
+        if (cost < maxQ) cost = maxQ;
     }
 
     /// @notice Calculates the instantaneous price for outcome i
