@@ -282,11 +282,16 @@ contract LSMathPrimitivesTest is Test {
     function testFuzz_divScale_inverse_of_mulScale(uint256 a, uint256 b) public view {
         a = bound(a, SCALE, 1e27);
         b = bound(b, SCALE, 1e27);
+        
         uint256 quotient = h.divScale(a, b);
         if (quotient == 0) return; // underflow to 0, skip
-        // quotient * b / SCALE should approximate a
+        
         uint256 recovered = (quotient * b) / SCALE;
-        // Allow 1 unit absolute rounding error from integer division
-        assertApproxEqAbs(recovered, a, 1e3, "divScale round-trip within rounding");
+        
+        // Calculate dynamic maximum delta:
+        // Max error is (1 unit of quotient) * b / SCALE, plus a tiny buffer for base rounding
+        uint256 maxDelta = (b / SCALE) + 1000;
+        
+        assertApproxEqAbs(recovered, a, maxDelta, "divScale round-trip within rounding");
     }
 }
