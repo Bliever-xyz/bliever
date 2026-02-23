@@ -527,15 +527,15 @@ library LSMath {
         // Integer part contribution: intPart * ln(2)
         uint256 intPartContribution = intPart * LN_2;
 
-        // Calculate fractional part using binary search
-        // Normalize x to [1, 2) range
-        uint256 xNorm = (x << (256 - 1 - intPart)) >> (256 - 1 - 59); // 59 bits precision
+        // Calculate fractional part f = (x / SCALE) / 2^intPart
+        // We normalize to xNorm = f * 2^59 to perform bitwise logic safely
+        uint256 xNorm = (x << 59) / (SCALE << intPart);
         uint256 fracPart = 0;
 
         // Binary search for ln(x) where x ∈ [1, 2)
         for (uint256 i = 0; i < 59; ) {
             xNorm = (xNorm * xNorm) >> 59;
-            if (xNorm >= 2**59) {
+            if (xNorm >= 2**60) {
                 xNorm >>= 1;
                 fracPart += LN_2 >> (i + 1);
             }
