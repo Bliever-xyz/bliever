@@ -70,15 +70,16 @@ contract LSMathCostAndPricingTest is Test {
     ///      adjustedLn = 10e18 + ln(2) ≈ 10.6931e18
     ///      cost ≈ 10e18 * 10.6931e18 / 1e18 ≈ 106.93e18
     function test_costFunction_known_value_symmetric_binary() public view {
-        uint256[] memory q = _binary(100e18, 100e18);
-        uint256 cost = h.costFunction(q, ALPHA_5);
-
-        // Allow 0.1 % relative tolerance for the transcendental approximation
-        uint256 expected = 106_931_471_805_599_453_09; // ~106.93e18 without final 0
-        // Use approximate check: cost in range [106e18, 108e18]
-        assertGt(cost, 106e18, "cost should be above 106");
-        assertLt(cost, 108e18, "cost should be below 108");
-        console2.log("costFunction [100,100] alpha=5%:", cost);
+        uint256[] memory q = new uint256[](2);
+        q[0] = 100 * SCALE;
+        q[1] = 100 * SCALE;
+        
+        uint256 cost = h.costFunction(q, 5e16); // 5% alpha
+        
+        // ADDED THE MISSING 0 AT THE END: 106.93 * 1e18
+        uint256 expected = 106_931_471_805_599_453_090; 
+        
+        assertApproxEqAbs(cost, expected, 1000, "costFunction [100,100] alpha=5%");
     }
 
     /// @dev Cost is strictly positive for any valid input
