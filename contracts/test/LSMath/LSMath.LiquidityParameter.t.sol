@@ -195,20 +195,29 @@ contract LSMathLiquidityParameterTest is Test {
         uint256 q1,
         uint256 alpha
     ) public view {
+        // Bound inputs to avoid massive overflows, but allow micro-values
+        q0 = bound(q0, 0, 1e28);
+        q1 = bound(q1, 0, 1e28);
+        vm.assume(q0 > 0 || q1 > 0); // Prevent EmptyQuantities / ZeroQuantitySum
         alpha = bound(alpha, MIN_ALPHA, MAX_ALPHA);
-        // Keep sum comfortably below uint256 max to avoid overflow
-        q0    = bound(q0, 0, 1e36);
-        q1    = bound(q1, 1, 1e36); // at least 1 to avoid ZeroQuantitySum
 
-        // Also ensure alpha * sumQ doesn't produce b = 0 after SCALE division
-        // (very tiny q values could round b to 0)
-        if (q0 + q1 < SCALE / alpha) return; // b would round to 0
+        uint256[] memory q = new uint256[](2);
+        q[0] = q0;
+        q[1] = q1;
 
-        uint256[] memory q = _binary(q0, q1);
         (uint256 b, uint256 sumQ) = h.liquidityParameter(q, alpha);
 
-        assertEq(sumQ, q0 + q1,         "sumQ must equal q0 + q1");
-        assertEq(b, (alpha * sumQ) / SCALE, "b must equal alpha * sumQ / SCALE");
+        // Calculate expected B using the exact same invariant rules as the contract
+        uint256 expectedSum = q0 + q1;
+        uint256 expectedB = (alpha * expectedSum) / SCALE;
+        
+        // Apply the safety clamp to the test's expected value
+        if (expectedB == 0) {
+            expectedB = 1;
+        }
+
+        assertEq(sumQ, expectedSum, "sumQ must equal q0 + q1");
+        assertEq(b, expectedB, "b must equal alpha * sumQ / SCALE (clamped to 1)");
     }
 
     /*//////////////////////////////////////////////////////////////
