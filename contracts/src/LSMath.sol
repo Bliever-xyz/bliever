@@ -553,9 +553,11 @@ library LSMath {
     /// @param b Second operand in 18-decimal fixed point
     /// @return result Product in 18-decimal fixed point
     function mulScale(uint256 a, uint256 b) internal pure returns (uint256 result) {
+        if (a == 0 || b == 0) return 0;
         uint256 product = a * b;
         if (product / a != b) revert MultiplicationOverflow();
-        result = product / SCALE;
+        // Round to nearest instead of purely truncating
+        result = (product + (SCALE / 2)) / SCALE;
     }
 
     /// @notice Divides two 18-decimal fixed-point numbers
@@ -565,9 +567,11 @@ library LSMath {
     /// @return result Quotient in 18-decimal fixed point
     function divScale(uint256 a, uint256 b) internal pure returns (uint256 result) {
         if (b == 0) revert DivisionByZero();
+        if (a == 0) return 0; // Fixes panic 0x12
         uint256 scaled = a * SCALE;
         if (scaled / a != SCALE) revert MultiplicationOverflow();
-        result = scaled / b;
+        // Round to nearest instead of purely truncating
+        result = (scaled + (b / 2)) / b;
     }
 
     /*//////////////////////////////////////////////////////////////
