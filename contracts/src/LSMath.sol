@@ -465,11 +465,10 @@ library LSMath {
         if (x > MAX_EXP_INPUT) revert ExponentialOverflow();
 
         // Range reduction: if x > ln(2), use e^x = 2 * e^(x-ln2)
-        uint256 multiplier = SCALE;
+        uint256 shift = 0;
         while (x > LN_2) {
             x -= LN_2;
-            multiplier = multiplier * 2;
-            if (multiplier < SCALE) revert ExponentialOverflow();
+            shift++;
         }
 
         // Taylor series: e^x = 1 + x + x²/2! + x³/3! + ...
@@ -489,8 +488,8 @@ library LSMath {
             }
         }
 
-        // Apply multiplier from range reduction
-        result = (sum * multiplier) / SCALE;
+        // Apply shift from range reduction (mathematically equivalent to * 2^shift)
+        result = sum << shift;
     }
 
     /// @notice Calculates ln(x) using logarithm approximation
