@@ -490,9 +490,16 @@ library LSMath {
                 ++i;
             }
         }
-
         // Apply shift from range reduction (mathematically equivalent to * 2^shift)
-        result = sum << shift;
+        // CRITICAL: Solidity 0.8+ does NOT revert on bit-shift overflows. Explicit check required.
+        if (shift > 0) {
+            if (sum > type(uint256).max >> shift) {
+                revert ExponentialOverflow();
+            }
+            result = sum << shift;
+        } else {
+            result = sum;
+        }
     }
 
     /// @notice Calculates ln(x) using logarithm approximation
