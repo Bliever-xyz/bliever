@@ -559,6 +559,7 @@ library LSMath {
     /// @param a First operand in 18-decimal fixed point
     /// @param b Second operand in 18-decimal fixed point
     /// @return result Product in 18-decimal fixed point
+    /// @dev Uses round-half-up (adding SCALE/2) instead of truncation to reduce cumulative precision loss.
     function mulScale(uint256 a, uint256 b) internal pure returns (uint256 result) {
         if (a == 0 || b == 0) return 0;
         uint256 product = a * b;
