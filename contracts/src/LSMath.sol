@@ -569,10 +569,10 @@ library LSMath {
     }
 
     /// @notice Divides two 18-decimal fixed-point numbers
-    /// @dev (a * SCALE) / b with overflow protection
     /// @param a Numerator in 18-decimal fixed point
     /// @param b Denominator in 18-decimal fixed point
     /// @return result Quotient in 18-decimal fixed point
+    /// @dev Uses round-half-up (adding b/2) instead of truncation to reduce cumulative precision loss.
     function divScale(uint256 a, uint256 b) internal pure returns (uint256 result) {
         if (b == 0) revert DivisionByZero();
         if (a == 0) return 0; // Fixes panic 0x12
