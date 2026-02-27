@@ -23,6 +23,7 @@ src  = "src"
 test = "test"
 out  = "out"
 libs = ["lib"]
+via_ir = true
 
 # ── Compiler ────────────────────────────────────────────────
 # Lock to exact version used in LSMath.sol for deterministic builds.
