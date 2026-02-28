@@ -23,7 +23,6 @@ src  = "src"
 test = "test"
 out  = "out"
 libs = ["lib"]
-via_ir = true
 
 # ── Compiler ────────────────────────────────────────────────
 # Lock to exact version used in LSMath.sol for deterministic builds.
@@ -43,13 +42,6 @@ via_ir = true
 # Base is EVM-compatible (same opcodes as Ethereum mainnet post-merge).
 # "paris" is a safe, widely-supported EVM version.
 evm_version = "paris"
-
-# ── Remappings ──────────────────────────────────────────────
-# forge-std is installed via `forge install foundry-rs/forge-std`
-# The path below assumes the default lib/forge-std location.
-remappings = [
-    "forge-std/=lib/forge-std/src/",
-]
 
 # ── Fuzz testing ─────────────────────────────────────────────
 # LSMath is a math library — fuzz testing is critical.
