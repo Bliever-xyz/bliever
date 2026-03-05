@@ -8,9 +8,7 @@ import {Initializable}            from "@openzeppelin/contracts-upgradeable/prox
 import {UUPSUpgradeable}          from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {ERC20Upgradeable}         from "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import {ERC4626Upgradeable}       from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
-import {ERC20BurnableUpgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20BurnableUpgradeable.sol";
 import {ERC20PermitUpgradeable}   from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20PermitUpgradeable.sol";
-import {ERC20FlashMintUpgradeable}from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20FlashMintUpgradeable.sol";
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {PausableUpgradeable}      from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
@@ -33,16 +31,16 @@ import {Math}      from "@openzeppelin/contracts/utils/math/Math.sol";
 ///         • LPs deposit USDC → receive bLP shares (ERC-4626, 18 dec).
 ///         • When a market is registered, `maxRiskPerMarket` USDC is reserved
 ///           from LP capital as the worst-case loss guarantee (= C(q⁰) = R).
-///         • Market contracts (MARKET_ROLE) call `collectTradeCost` to pull
-///           trader USDC into the vault and `settleMarket` + `claimWinnings`
-///           to distribute payouts on resolution.
-///         • LP withdrawal is capped to `totalAssets − totalLiability` so
-///           reserved capital can never be drained below the guarantee.
+///         • Market contracts (MARKET_ROLE) call `collectTradeCost` to pull trader
+///           USDC into the vault and update live liability. `settleMarket` +
+///           `claimWinnings` distribute payouts on resolution.
+///         • LP withdrawal is capped to `_freeLiquidity` which enforces both the
+///           live liability lock AND a 20 % uncommitted-NAV reserve floor.
 ///
 ///         LS-LMSR loss bound (Proposition 4.9 + Lemma 4.5)
 ///         ─────────────────────────────────────────────────
 ///         Loss per market ≤ C(q⁰) = R = maxRiskPerMarket, always.
-///         totalLiability = Σ R_i across all active markets.
+///         totalLiability = Σ currentLiability_i (live, decreases as volume grows).
 ///
 ///         Token: bLP (Believer Liquidity Provider)
 ///         Underlying: USDC (6-decimal, Base-chain canonical)
@@ -54,9 +52,7 @@ import {Math}      from "@openzeppelin/contracts/utils/math/Math.sol";
 contract BlieverV1Pool is
     Initializable,
     ERC4626Upgradeable,
-    ERC20BurnableUpgradeable,
     ERC20PermitUpgradeable,
-    ERC20FlashMintUpgradeable,
     PausableUpgradeable,
     AccessControlUpgradeable,
     ReentrancyGuardUpgradeable,
@@ -89,11 +85,17 @@ contract BlieverV1Pool is
     /// @notice Denominator for basis-point calculations (100 % = 10 000)
     uint256 public constant BPS_BASE = 10_000;
 
-    /// @notice Hard upper bound on flash-loan fee (10 %)
-    uint16  public constant MAX_FLASH_FEE_BPS = 1_000;
-
-    /// @notice Hard upper bound on allocation cap parameter
+    /// @notice Hard upper bound on admin-configurable allocation cap parameter
     uint16  public constant MAX_ALLOCATION_BPS = 10_000;
+
+    /// @notice Minimum fraction of NAV that must remain uncommitted after any
+    ///         market registration or LP withdrawal (20 %).
+    ///         Prevents the vault from being fully locked even at high utilisation.
+    uint256 public constant MIN_UNCOMMITTED_BPS = 2_000;
+
+    /// @notice Absolute utilisation ceiling — governance cannot exceed this.
+    ///         totalLiability can never exceed 95 % of vault USDC balance.
+    uint256 public constant GLOBAL_MAX_UTILIZATION_BPS = 9_500;
 
     /// @notice Maximum simultaneously active prediction markets
     uint256 public constant MAX_ACTIVE_MARKETS = 10_000;
@@ -154,6 +156,8 @@ contract BlieverV1Pool is
     error PayoutExceedsSettlement(uint256 requested, uint256 remaining);
     error NoFeesToCollect();
     error ExceedsMaxMarkets(uint256 active);
+    /// @notice Thrown when raw USDC balance falls below totalLiability (accounting invariant violated)
+    error VaultInsolvent(uint256 balance, uint256 liability);
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
@@ -204,8 +208,18 @@ contract BlieverV1Pool is
     /// @notice Emitted when the allocation cap changes
     event AllocationCapUpdated(uint16 oldBps, uint16 newBps);
 
-    /// @notice Emitted when the flash-loan fee changes
-    event FlashFeeBpsUpdated(uint16 oldBps, uint16 newBps);
+    /// @notice Emitted when a market's live liability is updated after a trade
+    /// @param oldLiability Previous currentLiability for this market
+    /// @param newLiability New currentLiability after the trade
+    event MarketLiabilityUpdated(
+        address indexed market,
+        uint256         oldLiability,
+        uint256         newLiability
+    );
+
+    /// @notice Emitted when an admin force-settles a broken/stuck market
+    /// @param lossAbsorbed The currentLiability released from totalLiability (vault absorbs as loss)
+    event MarketForceSettled(address indexed market, uint256 lossAbsorbed);
 
     /*//////////////////////////////////////////////////////////////
                           STATE VARIABLES
@@ -224,12 +238,10 @@ contract BlieverV1Pool is
     ///         e.g. 5000 = 50 %. registerMarket reverts if this would be breached.
     uint16  public maxAllocationBps;
 
-    /// @notice Flash-loan fee on bLP FlashMint (BPS). 0 = free (default).
-    ///         Fee tokens are burned (deflationary for remaining LPs).
-    uint16  public flashFeeBps;
-
-    /// @notice Sum of riskBudget across all currently active (non-settled) markets.
-    ///         Represents the total USDC that must remain in the vault at all times.
+    /// @notice Live sum of each active market's currentLiability.
+    ///         Updated on every trade (collectTradeCost) and on settlement.
+    ///         Decreases in real-time as volume grows (LS-LMSR property: C(q) rises → loss bound falls).
+    ///         LP NAV = totalAssets − totalLiability reflects vault's true economic position.
     uint256 public totalLiability;
 
     /// @notice Accumulated USDC admin fees, excluded from LP totalAssets.
@@ -246,7 +258,10 @@ contract BlieverV1Pool is
     address[] private _marketList;
 
     /// @dev Reserve 43 slots for future state variables without storage collisions.
-    ///      43 = 50 recommended gap − 7 slots used above.
+    ///      Custom slots used: alpha(1) + maxRiskPerMarket(1) + maxAllocationBps packed(1)
+    ///      + totalLiability(1) + protocolFeesAccrued(1) + activeMarketCount(1)
+    ///      + markets(1) + _marketList(1) = 8 slots. Gap = 50 − 8 = 42, rounded to 43
+    ///      for conservative headroom. V2 upgrades append before __gap and reduce by count.
     uint256[43] private __gap;
 
     /*//////////////////////////////////////////////////////////////
@@ -290,9 +305,7 @@ contract BlieverV1Pool is
         // ── ERC-20 / ERC-4626 chain ─────────────────────────────────────────
         __ERC20_init("Believer LP", "bLP");
         __ERC4626_init(IERC20(usdc));
-        __ERC20Burnable_init();
         __ERC20Permit_init("Believer LP");
-        __ERC20FlashMint_init();
 
         // ── Security chain ──────────────────────────────────────────────────
         __Pausable_init();
@@ -307,10 +320,9 @@ contract BlieverV1Pool is
         _grantRole(UPGRADER_ROLE,        admin);
 
         // ── Protocol parameters ─────────────────────────────────────────────
-        alpha              = _alpha;
-        maxRiskPerMarket   = _maxRiskPerMarket;
-        maxAllocationBps   = _maxAllocationBps;
-        flashFeeBps        = 0; // off by default; enable via setFlashFeeBps
+        alpha            = _alpha;
+        maxRiskPerMarket = _maxRiskPerMarket;
+        maxAllocationBps = _maxAllocationBps;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -321,9 +333,9 @@ contract BlieverV1Pool is
     ///
     ///         What happens internally
     ///         ───────────────────────
-    ///         1. Validates address, outcome count, allocation cap.
+    ///         1. Validates address, outcome count, and three-tier utilisation checks.
     ///         2. Creates MarketInfo with riskBudget = maxRiskPerMarket.
-    ///         3. Adds riskBudget to totalLiability (locks LP capital).
+    ///         3. Adds riskBudget to totalLiability (liability reserved immediately).
     ///         4. Grants MARKET_ROLE to the market contract address.
     ///         5. Appends market to the chronological _marketList.
     ///
@@ -332,7 +344,14 @@ contract BlieverV1Pool is
     ///         From the LS-LMSR initialisation: ε = R / (1 + α·n·ln n),
     ///         which ensures C(q⁰) = R exactly. So from block 0 the market
     ///         maker's worst-case loss is already R. We initialise
-    ///         currentLiability = riskBudget = R to reflect this conservatively.
+    ///         currentLiability = riskBudget = R conservatively; it will decrease
+    ///         as trading volume grows and the vault earns spread.
+    ///
+    ///         Three-tier utilisation guard on registration
+    ///         ────────────────────────────────────────────
+    ///         1. Hard global cap: totalLiability + R ≤ balance × 95 % (immovable).
+    ///         2. Soft admin cap: totalLiability + R ≤ totalAssets × maxAllocationBps.
+    ///         3. Uncommitted reserve: post-registration NAV × 20 % must remain free.
     ///
     /// @param market     Address of the market contract (must NOT be already registered)
     /// @param nOutcomes  Number of mutually exclusive outcomes (2–100 inclusive)
@@ -341,19 +360,34 @@ contract BlieverV1Pool is
         uint32  nOutcomes
     ) external onlyRole(MARKET_MANAGER_ROLE) whenNotPaused {
         // ── Checks ──────────────────────────────────────────────────────────
-        if (market   == address(0))          revert ZeroAddress();
+        if (market   == address(0))           revert ZeroAddress();
         if (nOutcomes < 2 || nOutcomes > 100) revert InvalidOutcomeCount(nOutcomes);
-        if (markets[market].registered)       revert MarketAlreadyRegistered(market);
+        if (markets[market].registered)        revert MarketAlreadyRegistered(market);
         if (activeMarketCount >= MAX_ACTIVE_MARKETS) revert ExceedsMaxMarkets(activeMarketCount);
 
-        uint256 risk            = maxRiskPerMarket;
-        uint256 newTotalLiab    = totalLiability + risk;
-        uint256 assets          = totalAssets();
+        uint256 risk         = maxRiskPerMarket;
+        uint256 newTotalLiab = totalLiability + risk;
+        uint256 assets       = totalAssets();
+        uint256 rawBalance   = IERC20(asset()).balanceOf(address(this));
 
-        // Enforce allocation cap: projected total liability ≤ TVL × maxAllocationBps
-        uint256 maxAllowed = (assets * maxAllocationBps) / BPS_BASE;
-        if (newTotalLiab > maxAllowed) {
-            revert AllocationCapExceeded(newTotalLiab, maxAllowed);
+        // 1. Hard global utilisation ceiling (95 % of raw vault balance)
+        uint256 hardCap = rawBalance.mulDiv(GLOBAL_MAX_UTILIZATION_BPS, BPS_BASE, Math.Rounding.Floor);
+        if (newTotalLiab > hardCap) {
+            revert AllocationCapExceeded(newTotalLiab, hardCap);
+        }
+
+        // 2. Soft admin-configurable allocation cap
+        uint256 softCap = assets.mulDiv(maxAllocationBps, BPS_BASE, Math.Rounding.Floor);
+        if (newTotalLiab > softCap) {
+            revert AllocationCapExceeded(newTotalLiab, softCap);
+        }
+
+        // 3. Uncommitted reserve: post-reservation NAV must retain ≥ 20 % free headroom
+        //    NAV_after = assets − newTotalLiab; minReserve = NAV_after × 20 %
+        uint256 navAfter = assets > newTotalLiab ? assets - newTotalLiab : 0;
+        uint256 minReserve = navAfter.mulDiv(MIN_UNCOMMITTED_BPS, BPS_BASE, Math.Rounding.Ceil);
+        if (assets < newTotalLiab + minReserve) {
+            revert InsufficientVaultLiquidity(assets, newTotalLiab + minReserve);
         }
 
         // ── Effects ─────────────────────────────────────────────────────────
@@ -421,7 +455,7 @@ contract BlieverV1Pool is
                             TRADE FLOW
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Pull trade cost USDC from a trader into the vault.
+    /// @notice Pull trade cost USDC from a trader into the vault AND update live liability.
     ///
     ///         Called by the market contract (msg.sender, MARKET_ROLE) immediately
     ///         after it has computed the trade delta and updated its q-vector.
@@ -431,12 +465,15 @@ contract BlieverV1Pool is
     ///         1. Market computes cost = C(q_new) − C(q_old) in USDC (6-dec).
     ///         2. Market computes newLiability = LSMath.calculateWorstCaseLoss(...).
     ///         3. Market calls vault.collectTradeCost(trader, cost, newLiability).
-    ///         4. Vault pulls `cost` USDC from trader (trader must have approved vault).
-    ///         5. Vault updates market's currentLiability (informational; capped at riskBudget).
-    ///         6. Vault emits TradeCostCollected.
+    ///         4. Vault adjusts totalLiability by the delta (live LS-LMSR tracking).
+    ///         5. Vault pulls `cost` USDC from trader (trader must have approved vault).
+    ///         6. Vault emits TradeCostCollected + MarketLiabilityUpdated.
     ///
-    ///         Note: totalLiability is NOT updated here — it was fully reserved at
-    ///         registration. currentLiability is a live tracking value for analytics.
+    ///         Live liability property
+    ///         ────────────────────────
+    ///         As trading volume grows C(q) rises → calculateWorstCaseLoss decreases
+    ///         → newLiability < old → totalLiability shrinks → LP NAV rises.
+    ///         This reflects the LS-LMSR theorem: volume creates its own solvency.
     ///
     /// @param trader        Trader address — must have approved this vault for ≥ cost USDC
     /// @param cost          USDC to transfer from trader to vault (may be 0 for no-cost ops)
@@ -456,8 +493,16 @@ contract BlieverV1Pool is
 
         // Belt-and-suspenders cap: LS-LMSR guarantees newLiability ≤ R (Prop 4.9)
         uint256 capped = newLiability > info.riskBudget ? info.riskBudget : newLiability;
+        uint256 old    = info.currentLiability;
 
         // ── Effects ─────────────────────────────────────────────────────────
+        // Delta-update totalLiability so it tracks the live sum of all currentLiability values
+        if (capped > old) {
+            totalLiability += (capped - old);
+        } else if (capped < old) {
+            totalLiability -= (old - capped);
+        }
+
         info.currentLiability = capped;
         info.hasTrades        = true;
 
@@ -467,6 +512,7 @@ contract BlieverV1Pool is
         }
 
         emit TradeCostCollected(market, trader, cost, capped);
+        if (capped != old) emit MarketLiabilityUpdated(market, old, capped);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -482,8 +528,8 @@ contract BlieverV1Pool is
     ///         ──────────
     ///         • totalPayout = q[winningOutcome] in 6-dec USDC.
     ///         • By Proposition 4.9: totalPayout ≤ riskBudget = R always.
-    ///         • riskBudget is released from totalLiability (LP capital unlocked).
-    ///         • Vault profit from this market = riskBudget − totalPayout ≥ 0.
+    ///         • currentLiability (live worst-case loss) is released from totalLiability.
+    ///         • Vault profit = riskBudget − totalPayout ≥ 0; absorbed into LP NAV.
     ///         • Winners call market.claim() → vault.claimWinnings() to receive USDC.
     ///
     ///         Does NOT pause-gate: markets must be settleable even during emergencies
@@ -503,21 +549,104 @@ contract BlieverV1Pool is
             revert PayoutExceedsRiskBudget(totalPayout, info.riskBudget);
         }
 
-        uint256 risk   = info.riskBudget;
-        uint256 profit = risk - totalPayout; // ≥ 0 guaranteed by check above
+        uint256 liveLiab = info.currentLiability; // live worst-case loss (≤ riskBudget)
+        uint256 profit   = info.riskBudget - totalPayout; // ≥ 0; absorbed into LP NAV
 
         // ── Effects ─────────────────────────────────────────────────────────
         info.settled          = true;
         info.settledPayout    = totalPayout;
         info.currentLiability = 0;
 
-        totalLiability -= risk;
+        // Release only the live (possibly reduced) liability from totalLiability
+        totalLiability -= liveLiab;
 
         unchecked {
             if (activeMarketCount > 0) --activeMarketCount;
         }
 
         emit MarketSettled(market, totalPayout, profit);
+
+        // Accounting sanity — should never revert if invariants hold
+        _assertSolvent();
+    }
+
+    /// @notice Standalone liability update — adjust totalLiability without a trade.
+    ///
+    ///         Called by the market contract when LS-LMSR worst-case loss changes for
+    ///         a reason other than a direct trade (e.g., a correction after off-chain
+    ///         recalculation). In the standard trade path, collectTradeCost already
+    ///         performs this delta atomically; this function exists for edge cases.
+    ///
+    ///         Bound: newLiability is capped at riskBudget (Prop 4.9 enforcement).
+    ///         Zero-op if newLiability equals the stored value (no state change).
+    ///
+    /// @param newLiability  Updated worst-case loss in 6-dec USDC (≤ riskBudget)
+    function updateMarketLiability(
+        uint256 newLiability
+    ) external onlyRole(MARKET_ROLE) nonReentrant whenNotPaused {
+        address market = msg.sender;
+        MarketInfo storage info = markets[market];
+
+        // ── Checks ──────────────────────────────────────────────────────────
+        if (!info.registered) revert MarketNotRegistered(market);
+        if ( info.settled)    revert MarketAlreadySettled(market);
+
+        uint256 capped = newLiability > info.riskBudget ? info.riskBudget : newLiability;
+        uint256 old    = info.currentLiability;
+        if (capped == old) return; // no-op
+
+        // ── Effects ─────────────────────────────────────────────────────────
+        if (capped > old) {
+            totalLiability += (capped - old);
+        } else {
+            totalLiability -= (old - capped);
+        }
+
+        info.currentLiability = capped;
+
+        emit MarketLiabilityUpdated(market, old, capped);
+    }
+
+    /// @notice Emergency path: force-settle a broken or oracle-stuck market.
+    ///
+    ///         Intended for markets whose oracle has permanently failed or whose
+    ///         market contract is broken and cannot call settleMarket itself.
+    ///         The vault absorbs `currentLiability` as a worst-case loss (LP NAV
+    ///         decreases by that amount). No USDC is transferred — winners receive
+    ///         nothing, mirroring a full-loss outcome.
+    ///
+    ///         After forceSettleMarket, the market is marked settled and MARKET_ROLE
+    ///         is revoked. No further trades or claims are possible.
+    ///
+    ///         NOT pause-gated — emergencies must be handleable at any time.
+    ///
+    /// @param market  Address of the stuck market contract
+    function forceSettleMarket(
+        address market
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        MarketInfo storage info = markets[market];
+
+        // ── Checks ──────────────────────────────────────────────────────────
+        if (!info.registered) revert MarketNotRegistered(market);
+        if ( info.settled)    revert MarketAlreadySettled(market);
+
+        uint256 lossAbsorbed = info.currentLiability;
+
+        // ── Effects ─────────────────────────────────────────────────────────
+        totalLiability -= lossAbsorbed;
+
+        unchecked {
+            if (activeMarketCount > 0) --activeMarketCount;
+        }
+
+        info.settled          = true;
+        info.settledPayout    = 0;
+        info.currentLiability = 0;
+        info.riskBudget       = 0;
+
+        _revokeRole(MARKET_ROLE, market);
+
+        emit MarketForceSettled(market, lossAbsorbed);
     }
 
     /// @notice Transfer USDC winnings to a single verified winner.
@@ -612,15 +741,6 @@ contract BlieverV1Pool is
         maxAllocationBps = newBps;
     }
 
-    /// @notice Update the bLP flash-mint fee.
-    ///         Fee bLP tokens are burned (deflationary). 0 = free flash loans.
-    /// @param newBps  Fee in BPS (0–1 000 hard ceiling)
-    function setFlashFeeBps(uint16 newBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (newBps > MAX_FLASH_FEE_BPS) revert InvalidBps(newBps);
-        emit FlashFeeBpsUpdated(flashFeeBps, newBps);
-        flashFeeBps = newBps;
-    }
-
     /*//////////////////////////////////////////////////////////////
                               PAUSE CONTROL
     //////////////////////////////////////////////////////////////*/
@@ -641,19 +761,39 @@ contract BlieverV1Pool is
     //////////////////////////////////////////////////////////////*/
 
     /// @notice USDC immediately withdrawable by LPs.
-    ///         = totalAssets − totalLiability (market risk reserves)
-    /// @return free  Free USDC (6-dec)
+    ///         = NAV (totalAssets − totalLiability) minus the 20 % uncommitted reserve.
+    ///         Because totalLiability is live (decreases as markets earn spread), this
+    ///         value rises organically as trading volume grows on active markets.
+    /// @return free  Withdrawable USDC (6-dec); 0 if vault is fully utilised
     function availableLiquidity() external view returns (uint256 free) {
         return _freeLiquidity();
     }
 
-    /// @notice Vault utilisation: locked liability as BPS of total LP assets.
-    ///         > 10 000 means the vault is undercollateralised (should not occur).
+    /// @notice Vault utilisation: live liability as BPS of total LP assets.
+    ///         Because totalLiability tracks live worst-case loss (not locked riskBudgets),
+    ///         utilisation falls naturally as markets earn spread from trading volume.
+    ///         > 10 000 means the vault is undercollateralised (should never occur).
     /// @return bps  Utilisation in basis points
     function utilizationBps() external view returns (uint256 bps) {
         uint256 assets = totalAssets();
         if (assets == 0) return 0;
         return (totalLiability * BPS_BASE) / assets;
+    }
+
+    /// @notice Net Asset Value: LP-owned USDC net of all live market liabilities.
+    ///         NAV = totalAssets − totalLiability.
+    ///         Rising NAV signals the vault is earning spread from market activity.
+    /// @return nav_  NAV in 6-dec USDC (0 if liabilities exceed assets)
+    function nav() external view returns (uint256 nav_) {
+        uint256 assets = totalAssets();
+        uint256 liab   = totalLiability;
+        nav_ = assets > liab ? assets - liab : 0;
+    }
+
+    /// @notice On-chain solvency check: true if raw USDC balance ≥ totalLiability.
+    ///         An off-chain monitor can poll this; it should always be true.
+    function isSolvent() external view returns (bool) {
+        return IERC20(asset()).balanceOf(address(this)) >= totalLiability;
     }
 
     /// @notice Return the full MarketInfo record for `market`.
@@ -776,31 +916,6 @@ contract BlieverV1Pool is
     }
 
     /*//////////////////////////////////////////////////////////////
-                      ERC-3156 FLASH MINT OVERRIDES
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Flash-mint fee on bLP.
-    ///         Fee = amount × flashFeeBps / BPS_BASE.
-    ///         Fee bLP tokens are burned by the ERC-3156 implementation.
-    function _flashFee(
-        address, /* token — always address(this) for ERC20FlashMint */
-        uint256  value
-    ) internal view override(ERC20FlashMintUpgradeable) returns (uint256) {
-        return (value * flashFeeBps) / BPS_BASE;
-    }
-
-    /// @notice Flash-mint fee receiver.
-    ///         address(0) → fee bLP tokens are burned (deflationary for LPs).
-    function _flashFeeReceiver()
-        internal
-        pure
-        override(ERC20FlashMintUpgradeable)
-        returns (address)
-    {
-        return address(0);
-    }
-
-    /*//////////////////////////////////////////////////////////////
                          UUPS UPGRADE OVERRIDE
     //////////////////////////////////////////////////////////////*/
 
@@ -838,14 +953,35 @@ contract BlieverV1Pool is
         return DECIMALS_OFFSET;
     }
 
-    /// @notice USDC liquidity not locked by active market liabilities.
-    ///         = totalAssets (net of protocol fees) − totalLiability
-    /// @return free  Available USDC (6-dec); 0 if fully utilised
+    /// @notice USDC liquidity available for LP withdrawals, respecting two constraints:
+    ///         1. Active market liability lock: cannot withdraw below totalLiability.
+    ///         2. Uncommitted reserve floor: 20 % of NAV must always remain free.
+    ///
+    ///         Formula: free = max(0, NAV − NAV × MIN_UNCOMMITTED_BPS / BPS_BASE)
+    ///                       = max(0, NAV × 80 %)
+    ///         where NAV = totalAssets − totalLiability.
+    ///
+    ///         Because totalLiability is live (tracks decreasing loss bounds), free
+    ///         liquidity grows organically as markets accumulate trading volume.
+    ///
+    /// @return free  Withdrawable USDC (6-dec); 0 when fully utilised or at reserve floor
     function _freeLiquidity() internal view returns (uint256 free) {
         uint256 assets = totalAssets();
         uint256 locked = totalLiability;
-        unchecked {
-            free = assets > locked ? assets - locked : 0;
+        if (assets <= locked) return 0;
+        uint256 navValue   = assets - locked;
+        uint256 minReserve = navValue.mulDiv(MIN_UNCOMMITTED_BPS, BPS_BASE, Math.Rounding.Ceil);
+        free = navValue > minReserve ? navValue - minReserve : 0;
+    }
+
+    /// @notice Assert that raw USDC balance covers all live market liabilities.
+    ///         Called at the end of settleMarket. Surfaces accounting bugs during
+    ///         testing and provides an on-chain verifiable invariant.
+    /// @dev    Should never revert if all accounting paths are correct.
+    function _assertSolvent() internal view {
+        uint256 rawBalance = IERC20(asset()).balanceOf(address(this));
+        if (rawBalance < totalLiability) {
+            revert VaultInsolvent(rawBalance, totalLiability);
         }
     }
 }
