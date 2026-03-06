@@ -154,7 +154,6 @@ contract BlieverV1Pool is
     error InsufficientVaultLiquidity(uint256 available, uint256 required);
     error PayoutExceedsRiskBudget(uint256 payout, uint256 budget);
     error PayoutExceedsSettlement(uint256 requested, uint256 remaining);
-    error NoFeesToCollect();
     error ExceedsMaxMarkets(uint256 active);
     /// @notice Thrown when raw USDC balance falls below totalLiability (accounting invariant violated)
     error VaultInsolvent(uint256 balance, uint256 liability);
