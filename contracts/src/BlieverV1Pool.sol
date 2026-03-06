@@ -240,10 +240,6 @@ contract BlieverV1Pool is
     ///         LP NAV = totalAssets − totalLiability reflects vault's true economic position.
     uint256 public totalLiability;
 
-    /// @notice Accumulated USDC admin fees, excluded from LP totalAssets.
-    ///         V1: always 0 (fee infrastructure present, rate default 0).
-    uint256 public protocolFeesAccrued;
-
     /// @notice Active (non-settled) market count
     uint256 public activeMarketCount;
 
