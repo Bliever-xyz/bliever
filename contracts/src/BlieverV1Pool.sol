@@ -249,12 +249,12 @@ contract BlieverV1Pool is
     /// @notice Chronological list of all ever-registered market addresses
     address[] private _marketList;
 
-    /// @dev Reserve 43 slots for future state variables without storage collisions.
+    /// @dev Reserve 44 slots for future state variables without storage collisions.
     ///      Custom slots used: alpha(1) + maxRiskPerMarket(1) + maxAllocationBps packed(1)
-    ///      + totalLiability(1) + protocolFeesAccrued(1) + activeMarketCount(1)
-    ///      + markets(1) + _marketList(1) = 8 slots. Gap = 50 − 8 = 42, rounded to 43
-    ///      for conservative headroom. V2 upgrades append before __gap and reduce by count.
-    uint256[43] private __gap;
+    ///      + totalLiability(1) + activeMarketCount(1) + markets(1) + _marketList(1)
+    ///      = 7 slots. Gap = 50 − 7 = 43, rounded to 44 for conservative headroom.
+    ///      Future upgrades append before __gap and reduce by count.
+    uint256[44] private __gap;
 
     /*//////////////////////////////////////////////////////////////
                             CONSTRUCTOR
@@ -679,30 +679,6 @@ contract BlieverV1Pool is
     }
 
     /*//////////////////////////////////////////////////////////////
-                         PROTOCOL FEE COLLECTION
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Sweep accumulated protocol fees (USDC) to a recipient.
-    /// @dev    protocolFeesAccrued is excluded from totalAssets so LP NAV is
-    ///         not diluted when fees are collected. V1 default rate = 0.
-    /// @param to  Recipient address (e.g. multisig treasury)
-    function collectProtocolFees(
-        address to
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
-        if (to == address(0)) revert ZeroAddress();
-        uint256 amount = protocolFeesAccrued;
-        if (amount == 0) revert NoFeesToCollect();
-
-        // ── Effects ─────────────────────────────────────────────────────────
-        protocolFeesAccrued = 0;
-
-        // ── Interaction ─────────────────────────────────────────────────────
-        IERC20(asset()).safeTransfer(to, amount);
-
-        emit ProtocolFeesCollected(to, amount);
-    }
-
-    /*//////////////////////////////////////////////////////////////
                          PARAMETER ADMINISTRATION
     //////////////////////////////////////////////////////////////*/
 
@@ -829,7 +805,6 @@ contract BlieverV1Pool is
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Total USDC managed for LP shareholders.
-    /// @dev    Excludes protocolFeesAccrued (admin-owned, not LP-owned).
     ///         Includes USDC locked for market liabilities — LPs own it, but
     ///         cannot withdraw it until markets settle (see maxWithdraw).
     function totalAssets()
@@ -838,9 +813,7 @@ contract BlieverV1Pool is
         override(ERC4626Upgradeable)
         returns (uint256)
     {
-        uint256 balance = IERC20(asset()).balanceOf(address(this));
-        uint256 fees    = protocolFeesAccrued;
-        return balance > fees ? balance - fees : 0;
+        return IERC20(asset()).balanceOf(address(this));
     }
 
     /// @notice Maximum USDC an owner can withdraw right now.
