@@ -195,9 +195,6 @@ contract BlieverV1Pool is
         uint256         amount
     );
 
-    /// @notice Emitted when protocol fees are swept to a recipient
-    event ProtocolFeesCollected(address indexed to, uint256 amount);
-
     /// @notice Emitted when the global alpha parameter changes
     event AlphaUpdated(uint256 oldAlpha, uint256 newAlpha);
 
