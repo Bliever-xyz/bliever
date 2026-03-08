@@ -189,6 +189,12 @@ contract BlieverV1Pool is
         uint256         amount
     );
 
+    /// @notice Emitted when all settledPayout has been claimed and MARKET_ROLE is revoked
+    event MarketFullyClaimed(address indexed market, uint256 totalPaid);
+
+    /// @notice Emitted when a market with zero trades is settled (riskBudget freed as profit)
+    event MarketExpiredUntraded(address indexed market, uint256 riskBudget);
+
     /// @notice Emitted when the global alpha parameter changes
     event AlphaUpdated(uint256 oldAlpha, uint256 newAlpha);
 
@@ -517,7 +523,6 @@ contract BlieverV1Pool is
         }
 
         uint256 liveLiab = info.currentLiability; // live worst-case loss (≤ riskBudget)
-        uint256 profit   = info.riskBudget - totalPayout; // ≥ 0; absorbed into LP NAV
 
         // ── Effects ─────────────────────────────────────────────────────────
         info.settled          = true;
@@ -529,7 +534,11 @@ contract BlieverV1Pool is
 
         --activeMarketCount; // reverts on underflow, surfacing any accounting bug
 
-        emit MarketSettled(market, totalPayout, profit);
+        emit MarketSettled(market, totalPayout, info.riskBudget - totalPayout);
+
+        if (!info.hasTrades) {
+            emit MarketExpiredUntraded(market, info.riskBudget);
+        }
 
         // Accounting sanity — should never revert if invariants hold
         _assertSolvent();
@@ -573,6 +582,9 @@ contract BlieverV1Pool is
         _revokeRole(MARKET_ROLE, market);
 
         emit MarketForceSettled(market, lossAbsorbed);
+
+        // Accounting sanity — should never revert if invariants hold
+        _assertSolvent();
     }
 
     /// @notice Transfer USDC winnings to a single verified winner.
@@ -585,12 +597,21 @@ contract BlieverV1Pool is
     ///         Pull-payment pattern: vault never proactively pushes funds.
     ///         Winner → market.claim() → vault.claimWinnings().
     ///
+    ///         NOT pause-gated — winners with a finalised, verified payout must
+    ///         never be blocked by vault-level operational pauses. settleMarket
+    ///         is already unpausable; blocking claimWinnings while settlement
+    ///         proceeds would strand verified payouts indefinitely.
+    ///
+    ///         When the last winner claims (claimedPayout == settledPayout),
+    ///         MARKET_ROLE is automatically revoked from the market contract
+    ///         and MarketFullyClaimed is emitted.
+    ///
     /// @param winner  Recipient of USDC winnings
     /// @param amount  USDC to transfer (6-dec; must not exceed remaining settlement budget)
     function claimWinnings(
         address winner,
         uint256 amount
-    ) external onlyRole(MARKET_ROLE) nonReentrant whenNotPaused {
+    ) external onlyRole(MARKET_ROLE) nonReentrant {
         address market = msg.sender;
         MarketInfo storage info = markets[market];
 
@@ -610,6 +631,13 @@ contract BlieverV1Pool is
         IERC20(asset()).safeTransfer(winner, amount);
 
         emit WinningsClaimed(market, winner, amount);
+
+        // Revoke MARKET_ROLE once all authorised winnings have been paid out.
+        // This removes the lingering role attack surface after full settlement.
+        if (info.claimedPayout == info.settledPayout) {
+            _revokeRole(MARKET_ROLE, market);
+            emit MarketFullyClaimed(market, info.settledPayout);
+        }
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -651,7 +679,9 @@ contract BlieverV1Pool is
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Pause deposits, withdrawals, trades, and token transfers.
-    ///         Settlement (settleMarket) is NOT paused — markets resolve regardless.
+    ///         Settlement (settleMarket, forceSettleMarket) and winner payouts
+    ///         (claimWinnings) are NOT paused — markets resolve and pay out
+    ///         regardless of vault operational state.
     function pause() external onlyRole(PAUSER_ROLE) {
         _pause();
     }
