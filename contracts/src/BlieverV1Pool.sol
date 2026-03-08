@@ -505,6 +505,13 @@ contract BlieverV1Pool is
     ///         • Vault profit = riskBudget − totalPayout ≥ 0; absorbed into LP NAV.
     ///         • Winners call market.claim() → vault.claimWinnings() to receive USDC.
     ///
+    ///         Zero-payout path
+    ///         ─────────────────
+    ///         When totalPayout == 0 (all positions on losing outcomes), no claim call
+    ///         can ever arrive — claimWinnings would revert on ZeroAmount or
+    ///         PayoutExceedsSettlement before reaching the role-revocation code.
+    ///         MARKET_ROLE is therefore revoked immediately in settleMarket for this case.
+    ///
     ///         Does NOT pause-gate: markets must be settleable even during emergencies
     ///         so traders are never permanently locked out of resolution.
     ///
@@ -522,22 +529,36 @@ contract BlieverV1Pool is
             revert PayoutExceedsRiskBudget(totalPayout, info.riskBudget);
         }
 
-        uint256 liveLiab = info.currentLiability; // live worst-case loss (≤ riskBudget)
+        uint256 liveLiab  = info.currentLiability; // live worst-case loss (≤ riskBudget)
+        uint256 riskBudget = info.riskBudget;       // cache before zeroing
 
         // ── Effects ─────────────────────────────────────────────────────────
         info.settled          = true;
         info.settledPayout    = totalPayout;
         info.currentLiability = 0;
 
-        // Release only the live (possibly reduced) liability from totalLiability
-        totalLiability -= liveLiab;
+        // liveLiab ≤ totalLiability by the totalLiability = Σ currentLiability invariant.
+        // riskBudget ≥ totalPayout validated by the check above.
+        // Both subtractions are provably safe; unchecked saves ~40 gas each on Base.
+        unchecked {
+            totalLiability -= liveLiab;
+        }
 
-        --activeMarketCount; // reverts on underflow, surfacing any accounting bug
+        --activeMarketCount; // intentionally checked — underflow surfaces accounting bugs
 
-        emit MarketSettled(market, totalPayout, info.riskBudget - totalPayout);
+        unchecked {
+            emit MarketSettled(market, totalPayout, riskBudget - totalPayout);
+        }
 
         if (!info.hasTrades) {
-            emit MarketExpiredUntraded(market, info.riskBudget);
+            emit MarketExpiredUntraded(market, riskBudget);
+        }
+
+        // Zero-payout: no valid claimWinnings call can ever arrive (remaining = 0).
+        // Revoke MARKET_ROLE now so it is never held indefinitely after settlement.
+        if (totalPayout == 0) {
+            _revokeRole(MARKET_ROLE, market);
+            emit MarketFullyClaimed(market, 0);
         }
 
         // Accounting sanity — should never revert if invariants hold
@@ -570,9 +591,12 @@ contract BlieverV1Pool is
         uint256 lossAbsorbed = info.currentLiability;
 
         // ── Effects ─────────────────────────────────────────────────────────
-        totalLiability -= lossAbsorbed;
+        // lossAbsorbed ≤ totalLiability by the totalLiability = Σ currentLiability invariant.
+        unchecked {
+            totalLiability -= lossAbsorbed;
+        }
 
-        --activeMarketCount; // reverts on underflow, surfacing any accounting bug
+        --activeMarketCount; // intentionally checked — underflow surfaces accounting bugs
 
         info.settled          = true;
         info.settledPayout    = 0;
@@ -602,9 +626,11 @@ contract BlieverV1Pool is
     ///         is already unpausable; blocking claimWinnings while settlement
     ///         proceeds would strand verified payouts indefinitely.
     ///
-    ///         When the last winner claims (claimedPayout == settledPayout),
+    ///         When the last winner claims (claimedPayout == settledPayout > 0),
     ///         MARKET_ROLE is automatically revoked from the market contract
-    ///         and MarketFullyClaimed is emitted.
+    ///         and MarketFullyClaimed is emitted. For zero-payout markets
+    ///         (settledPayout == 0), revocation is handled inside settleMarket
+    ///         because no valid claimWinnings call can ever reach this function.
     ///
     /// @param winner  Recipient of USDC winnings
     /// @param amount  USDC to transfer (6-dec; must not exceed remaining settlement budget)
