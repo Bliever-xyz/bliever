@@ -9,9 +9,13 @@ import {UUPSUpgradeable}          from "@openzeppelin/contracts-upgradeable/prox
 import {ERC20Upgradeable}         from "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import {ERC4626Upgradeable}       from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
 import {ERC20PermitUpgradeable}   from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20PermitUpgradeable.sol";
-import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import {AccessControlDefaultAdminRulesUpgradeable} from "@openzeppelin/contracts-upgradeable/access/extensions/AccessControlDefaultAdminRulesUpgradeable.sol";
 import {PausableUpgradeable}      from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
-import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+
+/*//////////////////////////////////////////////////////////////
+                       OPENZEPPELIN — STANDARD (REENTRANCY)
+//////////////////////////////////////////////////////////////*/
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /*//////////////////////////////////////////////////////////////
                        OPENZEPPELIN — STANDARD
@@ -54,8 +58,8 @@ contract BlieverV1Pool is
     ERC4626Upgradeable,
     ERC20PermitUpgradeable,
     PausableUpgradeable,
-    AccessControlUpgradeable,
-    ReentrancyGuardUpgradeable,
+    AccessControlDefaultAdminRulesUpgradeable,
+    ReentrancyGuard,
     UUPSUpgradeable
 {
     using SafeERC20 for IERC20;
@@ -72,11 +76,17 @@ contract BlieverV1Pool is
     ///         Required to call collectTradeCost, settleMarket, claimWinnings.
     bytes32 public constant MARKET_ROLE = keccak256("MARKET_ROLE");
 
-    /// @notice Allowed to pause / unpause the vault
+    /// @notice Allowed to pause the vault (a low-latency ops multisig in production)
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
 
     /// @notice Allowed to authorise UUPS implementation upgrades
     bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+
+    /// @notice Allowed to force-settle broken or oracle-stuck markets.
+    ///         Should be held by a faster-response multisig than DEFAULT_ADMIN_ROLE
+    ///         (fewer required signers) so emergency actions can execute without
+    ///         waiting for full governance quorum.
+    bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
 
     /*//////////////////////////////////////////////////////////////
                                CONSTANTS
@@ -151,6 +161,8 @@ contract BlieverV1Pool is
     error ExceedsMaxMarkets(uint256 active);
     /// @notice Thrown when raw USDC balance falls below totalLiability (accounting invariant violated)
     error VaultInsolvent(uint256 balance, uint256 liability);
+    /// @notice Thrown when claimedPayout somehow exceeds settledPayout (should never occur)
+    error AccountingInvariantViolated();
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
@@ -217,6 +229,12 @@ contract BlieverV1Pool is
     /// @param lossAbsorbed The currentLiability released from totalLiability (vault absorbs as loss)
     event MarketForceSettled(address indexed market, uint256 lossAbsorbed);
 
+    /// @notice Emitted when a market contract reports newLiability > riskBudget.
+    ///         This violates the LS-LMSR Proposition 4.9 invariant and indicates a
+    ///         misbehaving market contract. The vault silently caps the value; this event
+    ///         surfaces the anomaly for monitors and auditors.
+    event LiabilityCapApplied(address indexed market, uint256 reported, uint256 cap);
+
     /*//////////////////////////////////////////////////////////////
                           STATE VARIABLES
                   (append-only; never reorder for upgrades)
@@ -271,13 +289,24 @@ contract BlieverV1Pool is
     //////////////////////////////////////////////////////////////*/
 
     /// @notice One-time proxy initialisation — replaces constructor for upgradeable contracts
-    /// @dev    Caller becomes DEFAULT_ADMIN + MARKET_MANAGER + PAUSER + UPGRADER.
+    /// @dev    Caller becomes DEFAULT_ADMIN + MARKET_MANAGER + PAUSER + UPGRADER + EMERGENCY.
     ///         All OpenZeppelin init chains must be called explicitly.
-    /// @param usdc            USDC ERC-20 address on Base (underlying asset)
-    /// @param admin           Initial admin address (receives all privileged roles)
-    /// @param _alpha          LS-LMSR α (18-dec, e.g. 3e16 for 3 %)
+    ///
+    ///         ⚠️  PRODUCTION DEPLOYMENT — separate roles across independent multisigs:
+    ///             PAUSER_ROLE    → low-latency 2-of-3 ops multisig (fast circuit breaker).
+    ///             EMERGENCY_ROLE → faster-response multisig (fewer signers; emergency only).
+    ///             UPGRADER_ROLE  → high-security timelock contract.
+    ///             DEFAULT_ADMIN_ROLE → governance multisig (slowest, highest quorum).
+    ///         Granting all roles to a single address is acceptable only for testnet.
+    ///
+    ///         AccessControlDefaultAdminRules enforces two-step DEFAULT_ADMIN_ROLE transfer
+    ///         with a configurable minimum delay, protecting against single-key compromise.
+    ///
+    /// @param usdc               USDC ERC-20 address on Base (underlying asset)
+    /// @param admin              Initial admin address (receives all privileged roles)
+    /// @param _alpha             LS-LMSR α (18-dec, e.g. 3e16 for 3 %)
     /// @param _maxRiskPerMarket  Worst-case loss per market in raw USDC (6-dec, e.g. 1e6 = $1)
-    /// @param _reserveBps     Reserve buffer in BPS (range [MIN_RESERVE_BPS, MAX_RESERVE_BPS])
+    /// @param _reserveBps        Reserve buffer in BPS (range [MIN_RESERVE_BPS, MAX_RESERVE_BPS])
     function initialize(
         address usdc,
         address admin,
@@ -300,15 +329,15 @@ contract BlieverV1Pool is
 
         // ── Security chain ──────────────────────────────────────────────────
         __Pausable_init();
-        __AccessControl_init();
-        __ReentrancyGuard_init();
-        __UUPSUpgradeable_init();
+        // minDelay = 0 at launch; governance should increase via beginDefaultAdminTransfer
+        // once roles are distributed. Two-step accept is enforced regardless of delay.
+        __AccessControlDefaultAdminRules_init(0, admin);
 
         // ── Role grants ─────────────────────────────────────────────────────
-        _grantRole(DEFAULT_ADMIN_ROLE,   admin);
         _grantRole(MARKET_MANAGER_ROLE,  admin);
         _grantRole(PAUSER_ROLE,          admin);
         _grantRole(UPGRADER_ROLE,        admin);
+        _grantRole(EMERGENCY_ROLE,       admin);
 
         // ── Protocol parameters ─────────────────────────────────────────────
         alpha            = _alpha;
@@ -466,6 +495,10 @@ contract BlieverV1Pool is
 
         // Belt-and-suspenders cap: LS-LMSR guarantees newLiability ≤ R (Prop 4.9)
         uint256 capped = newLiability > info.riskBudget ? info.riskBudget : newLiability;
+        // If the cap fires, a market contract has violated Prop 4.9 — surface it immediately.
+        if (newLiability > info.riskBudget) {
+            emit LiabilityCapApplied(market, newLiability, info.riskBudget);
+        }
         uint256 old    = info.currentLiability;
 
         // ── Effects ─────────────────────────────────────────────────────────
@@ -581,7 +614,7 @@ contract BlieverV1Pool is
     /// @param market  Address of the stuck market contract
     function forceSettleMarket(
         address market
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+    ) external onlyRole(EMERGENCY_ROLE) nonReentrant {
         MarketInfo storage info = markets[market];
 
         // ── Checks ──────────────────────────────────────────────────────────
@@ -647,6 +680,7 @@ contract BlieverV1Pool is
         if (winner == address(0)) revert ZeroAddress();
         if (amount == 0)          revert ZeroAmount();
 
+        if (info.claimedPayout > info.settledPayout) revert AccountingInvariantViolated();
         uint256 remaining = info.settledPayout - info.claimedPayout;
         if (amount > remaining) revert PayoutExceedsSettlement(amount, remaining);
 
@@ -708,12 +742,16 @@ contract BlieverV1Pool is
     ///         Settlement (settleMarket, forceSettleMarket) and winner payouts
     ///         (claimWinnings) are NOT paused — markets resolve and pay out
     ///         regardless of vault operational state.
+    ///         PAUSER_ROLE may pause. Only DEFAULT_ADMIN_ROLE may unpause.
+    ///         This asymmetry ensures a compromised pauser key cannot defeat an
+    ///         emergency pause by immediately unpausing.
     function pause() external onlyRole(PAUSER_ROLE) {
         _pause();
     }
 
     /// @notice Resume normal vault operations.
-    function unpause() external onlyRole(PAUSER_ROLE) {
+    ///         Requires DEFAULT_ADMIN_ROLE — unpause requires higher authority than pause.
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
         _unpause();
     }
 
@@ -731,15 +769,18 @@ contract BlieverV1Pool is
         return _freeLiquidity();
     }
 
-    /// @notice Vault utilisation: live liability as BPS of total LP assets.
-    ///         Because totalLiability tracks live worst-case loss (not locked riskBudgets),
-    ///         utilisation falls naturally as markets earn spread from trading volume.
-    ///         > 10 000 means the vault is undercollateralised (should never occur).
-    /// @return bps  Utilisation in basis points
+    /// @notice Vault utilisation: live liability as BPS of active capital (total assets minus reserve buffer).
+    ///         Measuring against active capital — the portion actually available for markets — gives
+    ///         operators an accurate headroom signal. A value of 7000 means 30 % of deployable
+    ///         capital remains, regardless of how large the reserve buffer is.
+    ///         > 10 000 means active capital is fully encumbered (should never occur through normal paths).
+    /// @return bps  Utilisation in basis points relative to active capital
     function utilizationBps() external view returns (uint256 bps) {
         uint256 assets = totalAssets();
         if (assets == 0) return 0;
-        return totalLiability.mulDiv(BPS_BASE, assets, Math.Rounding.Floor);
+        uint256 activeCap = assets.mulDiv(BPS_BASE - reserveBps, BPS_BASE, Math.Rounding.Floor);
+        if (activeCap == 0) return type(uint256).max; // reserve consumes all assets
+        return totalLiability.mulDiv(BPS_BASE, activeCap, Math.Rounding.Floor);
     }
 
     /// @notice Net Asset Value: LP-owned USDC net of all live market liabilities.
@@ -866,7 +907,7 @@ contract BlieverV1Pool is
     /// @notice ERC-165 interface detection — merges AccessControl and ERC-4626.
     function supportsInterface(
         bytes4 interfaceId
-    ) public view override(AccessControlUpgradeable) returns (bool) {
+    ) public view override(AccessControlDefaultAdminRulesUpgradeable) returns (bool) {
         return super.supportsInterface(interfaceId);
     }
 
