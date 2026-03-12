@@ -4,7 +4,7 @@ pragma solidity 0.8.31;
 /*//////////////////////////////////////////////////////////////
                          FOUNDRY IMPORTS
 //////////////////////////////////////////////////////////////*/
-import {Test, console2} from "forge-std/Test.sol";
+import {Test, console2, Vm} from "forge-std/Test.sol";
 
 /*//////////////////////////////////////////////////////////////
                         OPENZEPPELIN IMPORTS
@@ -1577,8 +1577,8 @@ contract BlieverV1Pool_FuzzTest is BlieverV1PoolBase {
 
         // Must never underflow or go negative (uint, so must stay >= 0)
         uint256 free = pool.availableLiquidity();
-        assertGe(free, 0, "free liquidity must be ≥ 0 (should always hold for uint256)");
-        assertLe(pool.totalLiability(), pool.totalAssets(), "solvency: liability ≤ assets");
+        assertGe(free, 0, "free liquidity must be >= 0 (should always hold for uint256)");
+        assertLe(pool.totalLiability(), pool.totalAssets(), "solvency: liability <= assets");
     }
 
     /// @dev Settlement profit is always ≥ 0 (riskBudget ≥ totalPayout guaranteed by contract).
