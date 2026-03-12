@@ -168,6 +168,8 @@ contract PoolHandler is CommonBase, StdCheats, StdUtils {
 
     /// @dev Push a trade through a registered-unsettled market.
     ///      Trader always approves the vault directly.
+    ///      USDC mint/approve stays inside the cost > 0 guard; doCollectTrade and
+    ///      ghost update are outside it so zero-cost liability changes are exercised.
     function collectTrade(
         uint256 marketIdx,
         uint256 cost,
@@ -184,22 +186,22 @@ contract PoolHandler is CommonBase, StdCheats, StdUtils {
         newLiabilityFraction = bound(newLiabilityFraction, 0, 100);
         uint256 newLiab = (info.riskBudget * newLiabilityFraction) / 100;
 
+        address _trader = address(uint160(uint256(keccak256("trader"))));
         if (cost > 0) {
-            address _trader = address(uint160(uint256(keccak256("trader"))));
             usdc.mint(_trader, cost);
             vm.prank(_trader);
             usdc.approve(address(pool), cost);
-
-            uint256 oldLiab = info.currentLiability;
-            try m.doCollectTrade(_trader, cost, newLiab) {
-                // Sync ghost: delta update mirrors vault's own delta logic
-                if (newLiab < oldLiab) {
-                    ghost_expectedTotalLiability -= (oldLiab - newLiab);
-                } else if (newLiab > oldLiab) {
-                    ghost_expectedTotalLiability += (newLiab - oldLiab);
-                }
-            } catch {}
         }
+
+        uint256 oldLiab = info.currentLiability;
+        try m.doCollectTrade(_trader, cost, newLiab) {
+            // Sync ghost: delta update mirrors vault's own delta logic
+            if (newLiab < oldLiab) {
+                ghost_expectedTotalLiability -= (oldLiab - newLiab);
+            } else if (newLiab > oldLiab) {
+                ghost_expectedTotalLiability += (newLiab - oldLiab);
+            }
+        } catch {}
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -389,12 +391,17 @@ contract BlieverV1Pool_InvariantTest is StdInvariant, Test {
     /// @notice pool.totalLiability must equal the on-chain sum of currentLiability
     ///         across all active (registered, unsettled) markets tracked by the handler.
     ///
-    ///         This verifies that every collectTradeCost, settleMarket, and
-    ///         forceSettleMarket call maintains the running sum correctly.
+    ///         Two independent checks run in parallel:
+    ///           1. on-chain cross-check: vault sum vs. handler iteration of the mapping
+    ///           2. ghost cross-check: vault value vs. handler's separately-maintained
+    ///              delta counter — catches bugs where both the vault and on-chain iteration
+    ///              are wrong in the same way (e.g. same bad delta path affects both).
     function invariant_totalLiabilityEqualsSum() public view {
         uint256 onChainSum = handler.computeOnChainLiabilitySum();
         assertEq(pool.totalLiability(), onChainSum,
-            "INVARIANT VIOLATED: totalLiability != sum of active currentLiabilities");
+            "INVARIANT VIOLATED: totalLiability != on-chain sum of active currentLiabilities");
+        assertEq(pool.totalLiability(), handler.ghost_expectedTotalLiability(),
+            "INVARIANT VIOLATED: totalLiability != ghost_expectedTotalLiability");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -403,10 +410,13 @@ contract BlieverV1Pool_InvariantTest is StdInvariant, Test {
 
     /// @notice pool.activeMarketCount must match the count of registered+unsettled
     ///         markets in the handler's tracked set.
+    ///         Ghost counter provides a second independent verification path.
     function invariant_activeMarketCountConsistent() public view {
         uint256 onChainCount = handler.computeOnChainActiveCount();
         assertEq(pool.activeMarketCount(), onChainCount,
-            "INVARIANT VIOLATED: activeMarketCount mismatch");
+            "INVARIANT VIOLATED: activeMarketCount != on-chain count");
+        assertEq(pool.activeMarketCount(), handler.ghost_activeMarketCount(),
+            "INVARIANT VIOLATED: activeMarketCount != ghost_activeMarketCount");
     }
 
     /*//////////////////////////////////////////////////////////////
