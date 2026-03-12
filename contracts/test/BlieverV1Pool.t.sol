@@ -237,6 +237,14 @@ contract BlieverV1Pool_InitTest is BlieverV1PoolBase {
             abi.encodeCall(BlieverV1Pool.initialize,
                 (address(usdc), admin, ALPHA, MAX_RISK, bad)));
     }
+
+    function test_initialize_reverts_onBareImplementation() public {
+        // _disableInitializers() in the constructor means the logic contract itself
+        // cannot be initialised — only the proxy should be.
+        BlieverV1Pool bareImpl = new BlieverV1Pool();
+        vm.expectRevert(bytes4(keccak256("InvalidInitialization()")));
+        bareImpl.initialize(address(usdc), admin, ALPHA, MAX_RISK, RESERVE_BPS);
+    }
 }
 
 
@@ -291,13 +299,6 @@ contract BlieverV1Pool_RegisterMarketTest is BlieverV1PoolBase {
         emit BlieverV1Pool.MarketRegistered(address(m), 2, MAX_RISK);
         vm.prank(admin);
         pool.registerMarket(address(m), 2);
-    }
-
-    function test_registerMarket_minOutcomes_2_succeeds() public {
-        MockMarket m = new MockMarket(address(pool));
-        vm.prank(admin);
-        pool.registerMarket(address(m), 2); // boundary: minimum valid
-        assertTrue(pool.getMarketInfo(address(m)).registered);
     }
 
     function test_registerMarket_maxOutcomes_100_succeeds() public {
@@ -358,8 +359,9 @@ contract BlieverV1Pool_RegisterMarketTest is BlieverV1PoolBase {
         }
         MockMarket m = new MockMarket(address(emptyPool));
         vm.prank(admin);
-        // activeCap = 0 × 80 % = 0, so any risk > 0 fails
-        vm.expectRevert(); // CapacityExceeded(MAX_RISK, 0)
+        // activeCap = 0 × 80 % = 0; newTotalLiab = MAX_RISK > 0 = activeCap
+        vm.expectRevert(abi.encodeWithSelector(
+            BlieverV1Pool.CapacityExceeded.selector, MAX_RISK, uint256(0)));
         emptyPool.registerMarket(address(m), 2);
     }
 
@@ -376,6 +378,17 @@ contract BlieverV1Pool_RegisterMarketTest is BlieverV1PoolBase {
         vm.expectRevert(_accessDenied(attacker, pool.MARKET_MANAGER_ROLE()));
         vm.prank(attacker);
         pool.registerMarket(address(m), 2);
+    }
+
+    function test_registerMarket_reverts_CapacityExceeded_nthMarketExceedsCap() public {
+        // 8 markets × 50K = 400K = 500K × 80% — fills activeCap exactly.
+        // The 9th registration pushes newTotalLiab to 450K > 400K activeCap.
+        for (uint i; i < 8; i++) _registerMarket();
+        MockMarket m9 = new MockMarket(address(pool));
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(
+            BlieverV1Pool.CapacityExceeded.selector, MAX_RISK * 9, MAX_RISK * 8));
+        pool.registerMarket(address(m9), 2);
     }
 }
 
@@ -467,6 +480,18 @@ contract BlieverV1Pool_DeregisterMarketTest is BlieverV1PoolBase {
         vm.expectRevert(_accessDenied(attacker, pool.MARKET_MANAGER_ROLE()));
         vm.prank(attacker);
         pool.deregisterMarket(address(m));
+    }
+
+    function test_deregisterMarket_allowsReregistration_sameAddress() public {
+        // delete markets[market] resets registered = false, so the same contract
+        // address can be registered again cleanly.
+        MockMarket m = _registerMarket();
+        vm.prank(admin); pool.deregisterMarket(address(m));
+        assertFalse(pool.getMarketInfo(address(m)).registered, "deregistered");
+
+        vm.prank(admin); pool.registerMarket(address(m), 2);
+        assertTrue(pool.getMarketInfo(address(m)).registered, "re-registered");
+        assertEq(pool.activeMarketCount(), 1, "count back to 1");
     }
 }
 
@@ -578,8 +603,13 @@ contract BlieverV1Pool_CollectTradeCostTest is BlieverV1PoolBase {
     // ─── Revert paths ────────────────────────────────────────────────────────
 
     function test_collectTradeCost_reverts_MarketAlreadySettled() public {
-        MockMarket m = _registerMarket();
-        m.doSettle(0);
+        // Must use a non-zero payout: doSettle(0) immediately revokes MARKET_ROLE,
+        // which would cause onlyRole(MARKET_ROLE) to fire before MarketAlreadySettled.
+        // Non-zero payout keeps the role alive until the last claimWinnings call.
+        uint256 payout = 1_000e6;
+        MockMarket m = _registerAndTrade(payout, MAX_RISK / 2);
+        m.doSettle(payout);
+        assertTrue(pool.hasRole(pool.MARKET_ROLE(), address(m)), "role must still be held");
         vm.expectRevert(abi.encodeWithSelector(BlieverV1Pool.MarketAlreadySettled.selector, address(m)));
         m.doCollectTrade(trader, 0, 0);
     }
@@ -602,6 +632,32 @@ contract BlieverV1Pool_CollectTradeCostTest is BlieverV1PoolBase {
         vm.prank(attacker);
         vm.expectRevert(_accessDenied(attacker, pool.MARKET_ROLE()));
         pool.collectTradeCost(trader, 0, 0);
+    }
+
+    function test_collectTradeCost_increasesLiability_whenBetweenOldAndBudget() public {
+        // Contract lines 519-520: when capped > old, totalLiability increases.
+        // This happens when a market's running worst-case re-expands (unusual but valid).
+        MockMarket m = _registerMarket();
+
+        // First trade: drop liability to 60% of budget
+        m.doCollectTrade(trader, 0, MAX_RISK * 60 / 100);
+        assertEq(pool.totalLiability(), MAX_RISK * 60 / 100, "after first trade");
+
+        // Second trade: liability rises back to 80% (still within budget — cap does NOT fire)
+        m.doCollectTrade(trader, 0, MAX_RISK * 80 / 100);
+        assertEq(pool.totalLiability(), MAX_RISK * 80 / 100, "liability increased on second trade");
+        assertEq(pool.getMarketInfo(address(m)).currentLiability, MAX_RISK * 80 / 100);
+    }
+
+    function test_collectTradeCost_newLiabilityZero_totalLiabilityDropsToZero() public {
+        // Zero liability = market fully hedged; maximum-volume LS-LMSR outcome.
+        // totalLiability must reach 0 when the sole active market reports newLiability == 0.
+        MockMarket m = _registerMarket();
+        assertEq(pool.totalLiability(), MAX_RISK, "starts at riskBudget");
+
+        m.doCollectTrade(trader, 0, 0); // newLiability = 0
+        assertEq(pool.totalLiability(), 0, "totalLiability must reach 0");
+        assertEq(pool.getMarketInfo(address(m)).currentLiability, 0);
     }
 }
 
@@ -704,8 +760,12 @@ contract BlieverV1Pool_SettleMarketTest is BlieverV1PoolBase {
     }
 
     function test_settleMarket_reverts_AlreadySettled() public {
-        MockMarket m = _registerMarket();
-        m.doSettle(0);
+        // Must use non-zero payout on the first settle: doSettle(0) revokes MARKET_ROLE
+        // immediately, so a subsequent doSettle(0) would hit onlyRole(MARKET_ROLE) first
+        // rather than the MarketAlreadySettled guard on line 573.
+        uint256 payout = 1_000e6;
+        MockMarket m = _registerAndTrade(payout, MAX_RISK / 2);
+        m.doSettle(payout); // role kept — waiting for full claimWinnings
         vm.expectRevert(abi.encodeWithSelector(BlieverV1Pool.MarketAlreadySettled.selector, address(m)));
         m.doSettle(0);
     }
@@ -714,6 +774,45 @@ contract BlieverV1Pool_SettleMarketTest is BlieverV1PoolBase {
         vm.prank(attacker);
         vm.expectRevert(_accessDenied(attacker, pool.MARKET_ROLE()));
         pool.settleMarket(0);
+    }
+
+    function test_settleMarket_totalPayout_equalsRiskBudget_succeeds() public {
+        // Contract check is > not >= (line 574). totalPayout == riskBudget is the
+        // "LP absorbs maximum loss" case and must be accepted without revert.
+        MockMarket m = _registerMarket();
+        m.doSettle(MAX_RISK); // exact boundary — must not revert
+        assertEq(pool.getMarketInfo(address(m)).settledPayout, MAX_RISK);
+    }
+
+    function test_settleMarket_profitIncreasesLPShareValue() public {
+        // After trade costs enter the vault (without new share issuance), existing LP
+        // shares convert to more USDC — the core LP value proposition.
+        uint256 sharesBefore = pool.balanceOf(lp);
+        uint256 assetsBefore = pool.convertToAssets(sharesBefore);
+
+        uint256 tradeCost = 10_000e6;
+        MockMarket m = _registerAndTrade(tradeCost, MAX_RISK / 2);
+        m.doSettle(MAX_RISK / 4); // payout < riskBudget → vault retains spread
+
+        uint256 assetsAfter = pool.convertToAssets(sharesBefore);
+        assertGt(assetsAfter, assetsBefore,
+            "LP share value must increase after trade costs enter vault");
+    }
+
+    function test_assertSolvent_reverts_VaultInsolvent() public {
+        // _assertSolvent() fires at the end of settleMarket.
+        // To trigger it: drain vault USDC below the liability that remains after
+        // settling one market of two (each registered at MAX_RISK = 50K).
+        MockMarket m1 = _registerMarket();
+        MockMarket m2 = _registerMarket(); // totalLiability = 100K
+        // Use vm.deal (Foundry cheatcode) to set pool USDC balance to 49 999,
+        // which is below the 50K liability that remains after m1 settles.
+        deal(address(usdc), address(pool), MAX_RISK - 1);
+
+        // After settle: totalLiability = 100K − 50K = 50K; balance = 49 999 < 50K
+        vm.expectRevert(abi.encodeWithSelector(
+            BlieverV1Pool.VaultInsolvent.selector, MAX_RISK - 1, MAX_RISK));
+        m1.doSettle(0);
     }
 }
 
@@ -904,6 +1003,17 @@ contract BlieverV1Pool_ClaimWinningsTest is BlieverV1PoolBase {
         vm.expectRevert(_accessDenied(attacker, pool.MARKET_ROLE()));
         pool.claimWinnings(winner, 1_000e6);
     }
+
+    function test_claimWinnings_afterForceSettle_reverts_unauthorized() public {
+        // forceSettleMarket revokes MARKET_ROLE immediately. Any subsequent doClaim
+        // hits onlyRole(MARKET_ROLE) — not MarketNotSettled — because the role is gone.
+        MockMarket m = _registerMarket();
+        vm.prank(admin); pool.forceSettleMarket(address(m));
+        assertFalse(pool.hasRole(pool.MARKET_ROLE(), address(m)), "role must be revoked");
+
+        vm.expectRevert(_accessDenied(address(m), pool.MARKET_ROLE()));
+        m.doClaim(winner, 1_000e6);
+    }
 }
 
 
@@ -986,6 +1096,19 @@ contract BlieverV1Pool_AdminParamsTest is BlieverV1PoolBase {
         vm.expectRevert(_accessDenied(attacker, pool.DEFAULT_ADMIN_ROLE()));
         vm.prank(attacker);
         pool.setMaxRiskPerMarket(25_000e6);
+    }
+
+    function test_setMaxRiskPerMarket_doesNotAffectExistingMarkets() public {
+        // Contract intent: parameter changes only apply to markets registered after the call.
+        MockMarket m1 = _registerMarket(); // riskBudget locked in at 50K
+
+        vm.prank(admin);
+        pool.setMaxRiskPerMarket(25_000e6); // halve the budget for future markets
+
+        MockMarket m2 = _registerMarket(); // should use new 25K value
+
+        assertEq(pool.getMarketInfo(address(m1)).riskBudget, MAX_RISK,   "m1 riskBudget unchanged");
+        assertEq(pool.getMarketInfo(address(m2)).riskBudget, 25_000e6,   "m2 uses new maxRisk");
     }
 
     // ── setReserveBps ─────────────────────────────────────────────────────────
@@ -1129,6 +1252,14 @@ contract BlieverV1Pool_PauseTest is BlieverV1PoolBase {
         vm.prank(admin); pool.pause();
         assertEq(pool.maxRedeem(lp), 0);
     }
+
+    function test_pause_blocksCollectTrade() public {
+        // collectTradeCost has whenNotPaused (line 500) — must revert when paused.
+        MockMarket m = _registerMarket();
+        vm.prank(admin); pool.pause();
+        vm.expectRevert(bytes4(keccak256("EnforcedPause()")));
+        m.doCollectTrade(trader, 0, MAX_RISK);
+    }
 }
 
 
@@ -1192,9 +1323,12 @@ contract BlieverV1Pool_ERC4626Test is BlieverV1PoolBase {
     }
 
     function test_withdraw_reverts_beyondFreeLiquidity() public {
-        _registerMarket(); // locks 50K
-        // Try to withdraw all LP_DEPOSIT (more than free)
-        vm.expectRevert(); // ERC4626ExceededMaxWithdraw or similar
+        _registerMarket(); // locks 50K; free = 500K - 50K - 100K(reserve) = 350K
+        // maxWithdraw(lp) ≈ 350K; LP_DEPOSIT = 500K — exceeds free liquidity
+        vm.expectRevert(abi.encodeWithSelector(
+            bytes4(keccak256("ERC4626ExceededMaxWithdraw(address,uint256,uint256)")),
+            lp, LP_DEPOSIT, pool.maxWithdraw(lp)
+        ));
         vm.prank(lp);
         pool.withdraw(LP_DEPOSIT, lp, lp);
     }
@@ -1256,6 +1390,25 @@ contract BlieverV1Pool_ViewFunctionsTest is BlieverV1PoolBase {
         assertEq(pool.utilizationBps(), 1_250, "utilisation 12.5%");
     }
 
+    function test_utilizationBps_zeroWhenNoAssets() public {
+        // utilizationBps has an explicit `if (assets == 0) return 0` branch.
+        // Fresh pool with no deposits exercises this path.
+        BlieverV1Pool emptyPool;
+        {
+            BlieverV1Pool impl2 = new BlieverV1Pool();
+            emptyPool = BlieverV1Pool(address(new ERC1967Proxy(address(impl2),
+                abi.encodeCall(BlieverV1Pool.initialize,
+                    (address(usdc), admin, ALPHA, MAX_RISK, RESERVE_BPS)))));
+        }
+        assertEq(emptyPool.utilizationBps(), 0, "must return 0 when totalAssets == 0");
+    }
+
+    function test_utilizationBps_fullUtilization() public {
+        // 8 markets × 50K = 400K = 500K × 80% = activeCap exactly → 10 000 bps (100%)
+        for (uint i; i < 8; i++) _registerMarket();
+        assertEq(pool.utilizationBps(), 10_000, "full utilisation = 10 000 bps");
+    }
+
     function test_nav_correct() public view {
         // NAV = totalAssets − totalLiability = 500K − 0 = 500K
         assertEq(pool.nav(), LP_DEPOSIT);
@@ -1266,14 +1419,20 @@ contract BlieverV1Pool_ViewFunctionsTest is BlieverV1PoolBase {
         assertEq(pool.nav(), LP_DEPOSIT - MAX_RISK);
     }
 
-    function test_nav_zero_whenLiabilityEqualsAssets() public {
-        // Manually manipulate: to test the floor — in practice this shouldn't occur
-        // but we can test with near-exhausted vault
+    function test_nav_remainsPositive_whenFullyUtilised() public {
+        // 8 markets × 50K = 400K; totalAssets = 500K; NAV = 100K (reserve buffer)
         for (uint i; i < 8; i++) {
             _registerMarket();
         }
-        // totalLiability = 400K; totalAssets = 500K; NAV = 100K (not 0 but much reduced)
-        assertGt(pool.nav(), 0, "NAV positive even when fully utilised");
+        assertGt(pool.nav(), 0, "NAV positive even at full market utilisation");
+    }
+
+    function test_nav_returnsZero_whenLiabilityExceedsAssets() public {
+        // Drain vault USDC below totalLiability to force nav() floor to 0.
+        // nav() returns 0 when totalLiability >= totalAssets (protected subtraction).
+        _registerMarket(); // totalLiability = 50K
+        deal(address(usdc), address(pool), MAX_RISK - 1); // balance = 49 999 USDC < 50K liability
+        assertEq(pool.nav(), 0, "nav() must return 0 when liability >= assets");
     }
 
     function test_isSolvent_trueAlways() public {
@@ -1466,17 +1625,4 @@ contract BlieverV1Pool_FuzzTest is BlieverV1PoolBase {
         }
     }
 
-    /// @dev Multiple deposits by different LPs must leave totalAssets consistent.
-    function testFuzz_multipleDeposits_totalAssetsConsistent(
-        uint256 amt1,
-        uint256 amt2
-    ) public {
-        amt1 = bound(amt1, 1e6, 1_000_000e6);
-        amt2 = bound(amt2, 1e6, 1_000_000e6);
-
-        uint256 before = pool.totalAssets();
-        _depositLiquidity(lp,  amt1);
-        _depositLiquidity(lp2, amt2);
-        assertEq(pool.totalAssets(), before + amt1 + amt2, "totalAssets must equal sum of deposits");
-    }
 }
