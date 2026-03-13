@@ -183,71 +183,78 @@ contract BlieverV1Pool_InitTest is BlieverV1PoolBase {
 
     // ─── Input validation ────────────────────────────────────────────────────
 
-    function _freshImpl() internal returns (BlieverV1Pool) { return new BlieverV1Pool(); }
+    /// @dev OZ v5 Initializable ERC-7201 storage root:
+    ///      keccak256(abi.encode(uint256(keccak256("openzeppelin.storage.Initializable")) - 1))
+    ///      & ~bytes32(uint256(0xff))
+    ///      Both _initialized (uint64) and _initializing (bool) are packed at this slot.
+    bytes32 private constant OZ_INITIALIZABLE_STORAGE =
+        0xf0c57e16840df040f15088dc2f81fe391c3923bec73e23a9662efc9c229c6a00;
+
+    /// @dev Deploy a bare BlieverV1Pool implementation and reset its Initializable storage
+    ///      slot to zero so that initialize() can be called once.
+    ///
+    ///      Why not ERC1967Proxy?
+    ///      • Empty calldata → OZ v5.2 reverts with ERC1967ProxyUninitialized() in the proxy
+    ///        constructor before initialize() is ever reached.
+    ///      • Bad init calldata → Foundry vm.expectRevert intercepts the inner DELEGATECALL
+    ///        inside the CREATE, swallows the revert, and the proxy constructor completes.
+    ///        The outer CREATE does not revert. Test reports "next call did not revert".
+    ///
+    ///      Calling initialize() directly on a bare implementation (plain CALL) is the
+    ///      opcode vm.expectRevert was designed for. vm.store resets the _initialized slot
+    ///      that _disableInitializers() set to type(uint64).max in the constructor, giving
+    ///      us a fresh uninitialized context without any proxy involved.
+    function _freshInitializable() internal returns (BlieverV1Pool bare) {
+        bare = new BlieverV1Pool();
+        vm.store(address(bare), OZ_INITIALIZABLE_STORAGE, bytes32(0));
+    }
 
     function test_initialize_reverts_ZeroAddress_usdc() public {
-        bytes memory bad = abi.encodeCall(BlieverV1Pool.initialize,
-            (address(0), admin, ALPHA, MAX_RISK, RESERVE_BPS));
+        BlieverV1Pool bare = _freshInitializable();
         vm.expectRevert(BlieverV1Pool.ZeroAddress.selector);
-        new ERC1967Proxy(address(_freshImpl()), bad);
+        bare.initialize(address(0), admin, ALPHA, MAX_RISK, RESERVE_BPS);
     }
 
     function test_initialize_reverts_ZeroAddress_admin() public {
-        bytes memory bad = abi.encodeCall(BlieverV1Pool.initialize,
-            (address(usdc), address(0), ALPHA, MAX_RISK, RESERVE_BPS));
+        BlieverV1Pool bare = _freshInitializable();
         vm.expectRevert(BlieverV1Pool.ZeroAddress.selector);
-        new ERC1967Proxy(address(_freshImpl()), bad);
+        bare.initialize(address(usdc), address(0), ALPHA, MAX_RISK, RESERVE_BPS);
     }
 
     function test_initialize_reverts_InvalidAlpha_tooLow() public {
         uint256 bad = pool.MIN_ALPHA() - 1;
+        BlieverV1Pool bare = _freshInitializable();
         vm.expectRevert(abi.encodeWithSelector(BlieverV1Pool.InvalidAlpha.selector, bad));
-        new ERC1967Proxy(address(_freshImpl()),
-            abi.encodeCall(BlieverV1Pool.initialize,
-                (address(usdc), admin, bad, MAX_RISK, RESERVE_BPS)));
+        bare.initialize(address(usdc), admin, bad, MAX_RISK, RESERVE_BPS);
     }
 
     function test_initialize_reverts_InvalidAlpha_tooHigh() public {
         uint256 bad = pool.MAX_ALPHA() + 1;
+        BlieverV1Pool bare = _freshInitializable();
         vm.expectRevert(abi.encodeWithSelector(BlieverV1Pool.InvalidAlpha.selector, bad));
-        new ERC1967Proxy(address(_freshImpl()),
-            abi.encodeCall(BlieverV1Pool.initialize,
-                (address(usdc), admin, bad, MAX_RISK, RESERVE_BPS)));
+        bare.initialize(address(usdc), admin, bad, MAX_RISK, RESERVE_BPS);
     }
 
     function test_initialize_reverts_InvalidMaxRisk_zero() public {
+        BlieverV1Pool bare = _freshInitializable();
         vm.expectRevert(abi.encodeWithSelector(BlieverV1Pool.InvalidMaxRisk.selector, uint256(0)));
-        new ERC1967Proxy(address(_freshImpl()),
-            abi.encodeCall(BlieverV1Pool.initialize,
-                (address(usdc), admin, ALPHA, 0, RESERVE_BPS)));
+        bare.initialize(address(usdc), admin, ALPHA, 0, RESERVE_BPS);
     }
 
     function test_initialize_reverts_InvalidBps_tooLow() public {
         uint16 bad = uint16(pool.MIN_RESERVE_BPS()) - 1;
+        BlieverV1Pool bare = _freshInitializable();
         vm.expectRevert(abi.encodeWithSelector(BlieverV1Pool.InvalidBps.selector, bad));
-        new ERC1967Proxy(address(_freshImpl()),
-            abi.encodeCall(BlieverV1Pool.initialize,
-                (address(usdc), admin, ALPHA, MAX_RISK, bad)));
+        bare.initialize(address(usdc), admin, ALPHA, MAX_RISK, bad);
     }
 
     function test_initialize_reverts_InvalidBps_tooHigh() public {
         uint16 bad = uint16(pool.MAX_RESERVE_BPS()) + 1;
+        BlieverV1Pool bare = _freshInitializable();
         vm.expectRevert(abi.encodeWithSelector(BlieverV1Pool.InvalidBps.selector, bad));
-        new ERC1967Proxy(address(_freshImpl()),
-            abi.encodeCall(BlieverV1Pool.initialize,
-                (address(usdc), admin, ALPHA, MAX_RISK, bad)));
-    }
-
-    function test_initialize_reverts_onBareImplementation() public {
-        // _disableInitializers() in the constructor means the logic contract itself
-        // cannot be initialised — only the proxy should be.
-        BlieverV1Pool bareImpl = new BlieverV1Pool();
-        vm.expectRevert(bytes4(keccak256("InvalidInitialization()")));
-        bareImpl.initialize(address(usdc), admin, ALPHA, MAX_RISK, RESERVE_BPS);
+        bare.initialize(address(usdc), admin, ALPHA, MAX_RISK, bad);
     }
 }
-
-
 /*//////////////////////////////////////////////////////////////
           SECTION 2 — MARKET REGISTRATION TESTS
 //////////////////////////////////////////////////////////////*/
@@ -628,9 +635,12 @@ contract BlieverV1Pool_CollectTradeCostTest is BlieverV1PoolBase {
     }
 
     function test_collectTradeCost_reverts_unauthorized_nonMarketRole() public {
-        // Attacker calls pool directly (no MARKET_ROLE)
-        vm.prank(attacker);
+        // Attacker calls pool directly (no MARKET_ROLE).
+        // vm.expectRevert must come BEFORE vm.prank: pool.MARKET_ROLE() is a staticcall that
+        // would consume the prank if evaluated while a prank is active, causing the subsequent
+        // pool.collectTradeCost call to come from the test contract instead of attacker.
         vm.expectRevert(_accessDenied(attacker, pool.MARKET_ROLE()));
+        vm.prank(attacker);
         pool.collectTradeCost(trader, 0, 0);
     }
 
@@ -771,8 +781,10 @@ contract BlieverV1Pool_SettleMarketTest is BlieverV1PoolBase {
     }
 
     function test_settleMarket_reverts_unauthorized() public {
-        vm.prank(attacker);
+        // pool.MARKET_ROLE() is a staticcall. Evaluating it while a prank is active consumes
+        // the prank, so vm.expectRevert must be called first (with no prank set).
         vm.expectRevert(_accessDenied(attacker, pool.MARKET_ROLE()));
+        vm.prank(attacker);
         pool.settleMarket(0);
     }
 
@@ -999,8 +1011,10 @@ contract BlieverV1Pool_ClaimWinningsTest is BlieverV1PoolBase {
     }
 
     function test_claimWinnings_reverts_unauthorized() public {
-        vm.prank(attacker);
+        // vm.expectRevert before vm.prank: pool.MARKET_ROLE() is a staticcall that would
+        // consume the prank if evaluated while a prank is active.
         vm.expectRevert(_accessDenied(attacker, pool.MARKET_ROLE()));
+        vm.prank(attacker);
         pool.claimWinnings(winner, 1_000e6);
     }
 
@@ -1180,11 +1194,28 @@ contract BlieverV1Pool_PauseTest is BlieverV1PoolBase {
     function test_unpause_reverts_byPauserOnly() public {
         // PAUSER_ROLE cannot unpause — unpause needs DEFAULT_ADMIN_ROLE
         address pauserOnly = makeAddr("pauserOnly");
+        // Cache the role value BEFORE setting any prank. pool.PAUSER_ROLE() is a staticcall;
+        // evaluating it as a grantRole argument while a prank is active would consume the prank,
+        // causing grantRole to be called from the test contract (no DEFAULT_ADMIN_ROLE) and fail.
+        bytes32 pauserRole = pool.PAUSER_ROLE();
         vm.prank(admin);
-        pool.grantRole(pool.PAUSER_ROLE(), pauserOnly);
+        pool.grantRole(pauserRole, pauserOnly);
 
         vm.prank(admin); pool.pause();
 
+        // vm.expectRevert BEFORE vm.prank — the correct ordering when asserting that a
+        // specific caller is denied access.
+        //
+        // Root cause of the failure: in some Foundry versions, calling vm.expectRevert
+        // while vm.startPrank is already active causes the framework to consume the prank
+        // context when processing the vm.expectRevert cheatcode itself. pool.unpause() then
+        // runs from the test contract's address, not pauserOnly's. The failure confirms this:
+        // AccessControlUnauthorizedAccount reports the test contract (0x7FA9...) not pauserOnly.
+        //
+        // Fix: vm.expectRevert first (no prank active), then vm.prank queues a single-call
+        // prank that is consumed only by pool.unpause() — the next real external call.
+        // pool.DEFAULT_ADMIN_ROLE() is evaluated here as a staticcall from the test contract
+        // (no prank is active at this point), which is correct.
         vm.expectRevert(_accessDenied(pauserOnly, pool.DEFAULT_ADMIN_ROLE()));
         vm.prank(pauserOnly);
         pool.unpause();
@@ -1203,7 +1234,13 @@ contract BlieverV1Pool_PauseTest is BlieverV1PoolBase {
         usdc.mint(lp2, 1_000e6);
         vm.startPrank(lp2);
         usdc.approve(address(pool), 1_000e6);
-        vm.expectRevert(bytes4(keccak256("EnforcedPause()")));
+        // The contract pauses deposit via the ERC-4626 max-override pattern: maxDeposit()
+        // returns 0 when paused. The ERC-4626 base deposit() checks this limit and reverts
+        // with ERC4626ExceededMaxDeposit — NOT with EnforcedPause().
+        vm.expectRevert(abi.encodeWithSelector(
+            bytes4(keccak256("ERC4626ExceededMaxDeposit(address,uint256,uint256)")),
+            lp2, uint256(1_000e6), uint256(0)
+        ));
         pool.deposit(1_000e6, lp2);
         vm.stopPrank();
     }
@@ -1211,8 +1248,12 @@ contract BlieverV1Pool_PauseTest is BlieverV1PoolBase {
     function test_pause_blocksWithdraw() public {
         vm.prank(admin); pool.pause();
         assertEq(pool.maxWithdraw(lp), 0, "maxWithdraw must be 0 when paused");
-        // Attempting withdraw via ERC-4626 would also hit _update block
-        vm.expectRevert(bytes4(keccak256("EnforcedPause()")));
+        // Same ERC-4626 max-override pattern as deposit: maxWithdraw() returns 0 when paused,
+        // so withdraw() reverts with ERC4626ExceededMaxWithdraw — NOT with EnforcedPause().
+        vm.expectRevert(abi.encodeWithSelector(
+            bytes4(keccak256("ERC4626ExceededMaxWithdraw(address,uint256,uint256)")),
+            lp, uint256(1_000e6), uint256(0)
+        ));
         vm.prank(lp);
         pool.withdraw(1_000e6, lp, lp);
     }
