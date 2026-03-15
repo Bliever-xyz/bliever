@@ -340,16 +340,9 @@ contract BlieverV1Pool is
         _grantRole(EMERGENCY_ROLE,       admin);
 
         // ── Role admin hierarchy ─────────────────────────────────────────────
-        // By default, OZ AccessControl sets DEFAULT_ADMIN_ROLE as the admin of
-        // every role, meaning getRoleAdmin(MARKET_ROLE) returns DEFAULT_ADMIN_ROLE.
-        // This is inconsistent with intent: MARKET_MANAGER_ROLE controls market
-        // registration via registerMarket/deregisterMarket (which use internal
-        // _grantRole/_revokeRole and bypass the admin check). Any audit tool,
-        // Defender dashboard, or future contract using the public grantRole path
-        // would see a false owner and revert unexpectedly.
-        // Setting MARKET_MANAGER_ROLE as the admin of MARKET_ROLE makes on-chain
-        // metadata, tooling, and the public grantRole/revokeRole paths all consistent
-        // with the actual operational intent.
+        // MARKET_MANAGER_ROLE administers MARKET_ROLE: market managers can
+        // grant/revoke MARKET_ROLE via the public grantRole/revokeRole paths,
+        // consistent with their control over registerMarket/deregisterMarket.
         _setRoleAdmin(MARKET_ROLE, MARKET_MANAGER_ROLE);
 
         // ── Protocol parameters ─────────────────────────────────────────────
