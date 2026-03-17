@@ -36,8 +36,9 @@ import {Math}      from "@openzeppelin/contracts/utils/math/Math.sol";
 ///         • When a market is registered, `maxRiskPerMarket` USDC is reserved
 ///           from LP capital as the worst-case loss guarantee (= C(q⁰) = R).
 ///         • Market contracts (MARKET_ROLE) call `collectTradeCost` to pull trader
-///           USDC into the vault and update live liability. `settleMarket` +
-///           `claimWinnings` distribute payouts on resolution.
+///           USDC into the vault on a buy trade, and `distributeRefund` to push USDC
+///           back to the trader on a sell trade; both update live liability atomically.
+///           `settleMarket` + `claimWinnings` distribute payouts on resolution.
 ///         • LP withdrawal is capped to `_freeLiquidity` which enforces both the
 ///           live liability lock AND a 20 % uncommitted-NAV reserve floor.
 ///
@@ -191,6 +192,14 @@ contract BlieverV1Pool is
         address indexed market,
         address indexed trader,
         uint256         cost,
+        uint256         newCurrentLiability
+    );
+
+    /// @notice Emitted each time a trader's USDC is refunded for a sell trade
+    event RefundDistributed(
+        address indexed market,
+        address indexed trader,
+        uint256         refundAmount,
         uint256         newCurrentLiability
     );
 
@@ -525,6 +534,73 @@ contract BlieverV1Pool is
 
         emit TradeCostCollected(market, trader, cost, capped);
         if (capped != old) emit MarketLiabilityUpdated(market, old, capped);
+    }
+
+    /// @notice Push sell-refund USDC from vault to trader AND update live liability.
+    ///
+    ///         Called by the market contract (msg.sender, MARKET_ROLE) immediately
+    ///         after it has computed the sell delta and updated its q-vector.
+    ///
+    ///         Flow
+    ///         ────
+    ///         1. Market computes refundAmount = C(q_old) − C(q_new) in USDC (6-dec).
+    ///         2. Market computes newLiability  = LSMath.calculateWorstCaseLoss(...).
+    ///         3. Market calls vault.distributeRefund(trader, refundAmount, newLiability).
+    ///         4. Vault adjusts totalLiability by the delta (live LS-LMSR tracking).
+    ///         5. Vault pushes `refundAmount` USDC to trader.
+    ///         6. Vault emits RefundDistributed + MarketLiabilityUpdated (if delta ≠ 0).
+    ///         7. Vault asserts solvency — balance must still cover all liabilities.
+    ///
+    ///         Sell-side liability behaviour
+    ///         ──────────────────────────────
+    ///         Selling shares reduces C(q) and shifts the obligation vector q back toward
+    ///         the initialisation point q⁰. The new worst-case loss may rise or fall
+    ///         depending on market skew. Belt-and-suspenders cap always applies.
+    ///
+    /// @param trader        Recipient of the refund USDC
+    /// @param refundAmount  USDC to transfer from vault to trader (may be 0 for zero-cost ops)
+    /// @param newLiability  Updated worst-case loss after this sell trade (6-dec USDC, ≤ riskBudget)
+    function distributeRefund(
+        address trader,
+        uint256 refundAmount,
+        uint256 newLiability
+    ) external onlyRole(MARKET_ROLE) nonReentrant whenNotPaused {
+        address market = msg.sender;
+        MarketInfo storage info = markets[market];
+
+        // ── Checks ──────────────────────────────────────────────────────────
+        if (!info.registered) revert MarketNotRegistered(market);
+        if ( info.settled)    revert MarketAlreadySettled(market);
+        if (trader == address(0)) revert ZeroAddress();
+
+        // Belt-and-suspenders cap: LS-LMSR guarantees newLiability ≤ R (Prop 4.9)
+        uint256 capped = newLiability > info.riskBudget ? info.riskBudget : newLiability;
+        if (newLiability > info.riskBudget) {
+            emit LiabilityCapApplied(market, newLiability, info.riskBudget);
+        }
+
+        uint256 old = info.currentLiability;
+
+        // ── Effects ─────────────────────────────────────────────────────────
+        if (capped > old) {
+            totalLiability += (capped - old);
+        } else if (capped < old) {
+            totalLiability -= (old - capped);
+        }
+
+        info.currentLiability = capped;
+        info.hasTrades        = true;   // defensive: sell confirms market has activity
+
+        // ── Interaction ─────────────────────────────────────────────────────
+        if (refundAmount > 0) {
+            IERC20(asset()).safeTransfer(trader, refundAmount);
+        }
+
+        emit RefundDistributed(market, trader, refundAmount, capped);
+        if (capped != old) emit MarketLiabilityUpdated(market, old, capped);
+
+        // Vault must still cover all liabilities after sending USDC out
+        _assertSolvent();
     }
 
     /*//////////////////////////////////////////////////////////////
