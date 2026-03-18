@@ -587,9 +587,7 @@ contract BlieverV1Pool is
         } else if (capped < old) {
             totalLiability -= (old - capped);
         }
-
         info.currentLiability = capped;
-        info.hasTrades        = true;   // defensive: sell confirms market has activity
 
         // ── Interaction ─────────────────────────────────────────────────────
         if (refundAmount > 0) {
