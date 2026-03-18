@@ -39,4 +39,13 @@ contract MockMarket {
     function doClaim(address winner_, uint256 amount) external {
         vault.claimWinnings(winner_, amount);
     }
+
+    /// @dev Calls vault.distributeRefund — pushes USDC from vault to trader for a sell.
+    function doDistributeRefund(
+        address trader_,
+        uint256 refundAmount,
+        uint256 newLiability
+    ) external {
+        vault.distributeRefund(trader_, refundAmount, newLiability);
+    }
 }
