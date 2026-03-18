@@ -669,8 +669,198 @@ contract BlieverV1Pool_CollectTradeCostTest is BlieverV1PoolBase {
         assertEq(pool.totalLiability(), 0, "totalLiability must reach 0");
         assertEq(pool.getMarketInfo(address(m)).currentLiability, 0);
     }
-}
 
+}
+/*//////////////////////////////////////////////////////////////
+         SECTION 4B — DISTRIBUTE REFUND TESTS
+//////////////////////////////////////////////////////////////*/
+
+/// @notice Tests for distributeRefund() — the vault's sell-side counterpart to
+///         collectTradeCost(). Key structural differences versus collectTradeCost:
+///
+///   • USDC flows OUT (vault → trader via safeTransfer) instead of IN.
+///   • hasTrades is NOT set — a sell-only market is still deregisterable.
+///   • _assertSolvent() is called at the end — outgoing USDC must not break
+///     the vault's solvency invariant.
+///   • refundAmount == 0 is valid and only updates liability (no transfer).
+contract BlieverV1Pool_DistributeRefundTest is BlieverV1PoolBase {
+
+    // ─── Happy path ─────────────────────────────────────────────────────────
+
+    function test_distributeRefund_transfersUSDCToTrader() public {
+        uint256 refund = 5_000e6;
+        MockMarket m = _registerMarket();
+        // Vault holds LP_DEPOSIT (500K); totalLiability = MAX_RISK (50K).
+        // Refunding 5K leaves vault = 495K >> 50K liability — remains solvent.
+        uint256 vaultBefore  = usdc.balanceOf(address(pool));
+        uint256 traderBefore = usdc.balanceOf(trader);
+
+        m.doDistributeRefund(trader, refund, MAX_RISK); // liability unchanged
+        assertEq(usdc.balanceOf(address(pool)), vaultBefore  - refund, "vault decreased");
+        assertEq(usdc.balanceOf(trader),        traderBefore + refund, "trader received");
+    }
+
+    function test_distributeRefund_zeroRefund_noUSDCTransfer() public {
+        // refundAmount == 0 is a valid call — only updates liability, no transfer.
+        MockMarket m = _registerMarket();
+        uint256 vaultBefore = usdc.balanceOf(address(pool));
+
+        m.doDistributeRefund(trader, 0, MAX_RISK / 2);
+        assertEq(usdc.balanceOf(address(pool)), vaultBefore,    "vault balance unchanged");
+        assertEq(pool.totalLiability(),         MAX_RISK / 2,   "liability updated");
+    }
+
+    function test_distributeRefund_decreasesLiability() public {
+        // Normal sell: position partially closed, newLiability < currentLiability.
+        MockMarket m = _registerMarket();
+        uint256 newLiab = MAX_RISK / 2;
+
+        m.doDistributeRefund(trader, 0, newLiab);
+        assertEq(pool.totalLiability(),                           newLiab, "totalLiability decreased");
+        assertEq(pool.getMarketInfo(address(m)).currentLiability, newLiab, "market liability");
+    }
+
+    function test_distributeRefund_increasesLiability_whenBetweenOldAndBudget() public {
+        // First sell drops to 60 %; second call re-expands to 80 % (still ≤ riskBudget).
+        // The capped > old branch in distributeRefund must add the delta to totalLiability.
+        MockMarket m = _registerMarket();
+
+        m.doDistributeRefund(trader, 0, MAX_RISK * 60 / 100);
+        assertEq(pool.totalLiability(), MAX_RISK * 60 / 100, "after first call");
+
+        m.doDistributeRefund(trader, 0, MAX_RISK * 80 / 100);
+        assertEq(pool.totalLiability(), MAX_RISK * 80 / 100, "liability increased on second call");
+        assertEq(pool.getMarketInfo(address(m)).currentLiability, MAX_RISK * 80 / 100);
+    }
+
+    function test_distributeRefund_newLiabilityZero_dropsToZero() public {
+        // All positions closed: market fully hedged. totalLiability must reach 0.
+        MockMarket m = _registerMarket();
+        m.doDistributeRefund(trader, 0, 0);
+        assertEq(pool.totalLiability(),                           0, "totalLiability reaches 0");
+        assertEq(pool.getMarketInfo(address(m)).currentLiability, 0);
+    }
+
+    function test_distributeRefund_capsLiabilityAtRiskBudget() public {
+        // A misbehaving market reports newLiability > riskBudget even on a sell.
+        // The vault must cap it and emit LiabilityCapApplied.
+        MockMarket m = _registerMarket();
+        uint256 overBudget = MAX_RISK + 1_000e6;
+
+        vm.expectEmit(true, false, false, true, address(pool));
+        emit BlieverV1Pool.LiabilityCapApplied(address(m), overBudget, MAX_RISK);
+        m.doDistributeRefund(trader, 0, overBudget);
+
+        assertEq(pool.getMarketInfo(address(m)).currentLiability, MAX_RISK, "capped at riskBudget");
+        assertEq(pool.totalLiability(), MAX_RISK, "totalLiability uses capped value");
+    }
+
+    function test_distributeRefund_emitsRefundDistributed() public {
+        MockMarket m = _registerMarket();
+        uint256 refund  = 2_000e6;
+        uint256 newLiab = MAX_RISK / 2;
+
+        vm.expectEmit(true, true, false, true, address(pool));
+        emit BlieverV1Pool.RefundDistributed(address(m), trader, refund, newLiab);
+        m.doDistributeRefund(trader, refund, newLiab);
+    }
+
+    function test_distributeRefund_emitsMarketLiabilityUpdated_whenChanged() public {
+        MockMarket m = _registerMarket();
+        uint256 newLiab = 30_000e6;
+
+        vm.expectEmit(true, false, false, true, address(pool));
+        emit BlieverV1Pool.MarketLiabilityUpdated(address(m), MAX_RISK, newLiab);
+        m.doDistributeRefund(trader, 0, newLiab);
+    }
+
+    function test_distributeRefund_noLiabilityEvent_whenUnchanged() public {
+        MockMarket m = _registerMarket();
+        vm.recordLogs();
+        m.doDistributeRefund(trader, 0, MAX_RISK); // same as initialised value — no delta
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        bytes32 liabUpdatedTopic = keccak256("MarketLiabilityUpdated(address,uint256,uint256)");
+        for (uint i; i < logs.length; i++) {
+            assertTrue(logs[i].topics[0] != liabUpdatedTopic, "must NOT emit MarketLiabilityUpdated");
+        }
+    }
+
+    function test_distributeRefund_doesNotSetHasTrades() public {
+        // distributeRefund must NOT set hasTrades. Only collectTradeCost sets it.
+        // If distributeRefund set hasTrades, a sell-only market could never be
+        // deregistered — the deregisterMarket guard would block it permanently.
+        MockMarket m = _registerMarket();
+        assertFalse(pool.getMarketInfo(address(m)).hasTrades, "starts false");
+
+        m.doDistributeRefund(trader, 0, MAX_RISK); // sell with no liability change
+        assertFalse(pool.getMarketInfo(address(m)).hasTrades, "still false after distributeRefund");
+
+        // Deregister must succeed — no trades on record
+        vm.prank(admin);
+        pool.deregisterMarket(address(m)); // reverts with MarketHasTrades if flag was set
+        assertEq(pool.activeMarketCount(), 0, "deregistered cleanly");
+    }
+
+    // ─── Revert paths ────────────────────────────────────────────────────────
+
+    function test_distributeRefund_reverts_VaultInsolvent() public {
+        // Register one market → totalLiability = MAX_RISK.
+        // Set vault USDC to exactly MAX_RISK so any outgoing transfer makes
+        // balance < totalLiability and _assertSolvent() fires.
+        MockMarket m = _registerMarket();
+        deal(address(usdc), address(pool), MAX_RISK); // vault = 50K, liability = 50K
+
+        // Send 1 wei out: vault drops to MAX_RISK - 1, liability stays MAX_RISK.
+        vm.expectRevert(abi.encodeWithSelector(
+            BlieverV1Pool.VaultInsolvent.selector, MAX_RISK - 1, MAX_RISK));
+        m.doDistributeRefund(trader, 1, MAX_RISK);
+    }
+
+    function test_distributeRefund_reverts_MarketNotRegistered() public {
+        // To reach MarketNotRegistered, the caller must pass onlyRole(MARKET_ROLE)
+        // but address(m) must not be in the markets mapping.
+        // Manually grant MARKET_ROLE to an unregistered contract.
+        MockMarket m = new MockMarket(address(pool));
+        bytes32 marketRole = pool.MARKET_ROLE(); // cache before prank
+        vm.prank(admin);
+        pool.grantRole(marketRole, address(m));
+
+        vm.expectRevert(abi.encodeWithSelector(BlieverV1Pool.MarketNotRegistered.selector, address(m)));
+        m.doDistributeRefund(trader, 0, 0);
+    }
+
+    function test_distributeRefund_reverts_MarketAlreadySettled() public {
+        // doSettle(0) revokes MARKET_ROLE immediately — onlyRole fires before the
+        // MarketAlreadySettled check. Use a non-zero payout to keep the role alive.
+        uint256 payout = 1_000e6;
+        MockMarket m = _registerAndTrade(payout, MAX_RISK / 2);
+        m.doSettle(payout); // MARKET_ROLE kept — waiting for full claim
+        assertTrue(pool.hasRole(pool.MARKET_ROLE(), address(m)), "role still held");
+
+        vm.expectRevert(abi.encodeWithSelector(BlieverV1Pool.MarketAlreadySettled.selector, address(m)));
+        m.doDistributeRefund(trader, 0, 0);
+    }
+
+    function test_distributeRefund_reverts_ZeroAddress_trader() public {
+        MockMarket m = _registerMarket();
+        vm.expectRevert(BlieverV1Pool.ZeroAddress.selector);
+        m.doDistributeRefund(address(0), 0, MAX_RISK);
+    }
+
+    function test_distributeRefund_reverts_whenPaused() public {
+        MockMarket m = _registerMarket();
+        vm.prank(admin); pool.pause();
+        vm.expectRevert(bytes4(keccak256("EnforcedPause()")));
+        m.doDistributeRefund(trader, 0, MAX_RISK);
+    }
+
+    function test_distributeRefund_reverts_unauthorized() public {
+        vm.expectRevert(_accessDenied(attacker, pool.MARKET_ROLE()));
+        vm.prank(attacker);
+        pool.distributeRefund(trader, 0, 0);
+    }
+}
 
 /*//////////////////////////////////////////////////////////////
              SECTION 5 — SETTLE MARKET TESTS
