@@ -204,6 +204,46 @@ contract PoolHandler is CommonBase, StdCheats, StdUtils {
         } catch {}
     }
 
+    /// @dev Push a sell-refund through a registered-unsettled market.
+    ///      refundAmount is bounded to (vault_balance − totalLiability) so the call
+    ///      never triggers VaultInsolvent — solvency violations are exercised in the
+    ///      unit suite. The ghost delta update mirrors the vault's own capped-delta logic.
+    function distributeRefund(
+        uint256 marketIdx,
+        uint256 refundAmount,
+        uint256 newLiabilityFraction
+    ) external {
+        if (allMarkets.length == 0) return;
+        marketIdx = bound(marketIdx, 0, allMarkets.length - 1);
+        MockMarket m = allMarkets[marketIdx];
+
+        BlieverV1Pool.MarketInfo memory info = pool.getMarketInfo(address(m));
+        if (!info.registered || info.settled) return;
+
+        // Safe upper bound on refundAmount: never exceed vault surplus above liability
+        uint256 vaultBal   = usdc.balanceOf(address(pool));
+        uint256 liab       = pool.totalLiability();
+        uint256 surplus    = vaultBal > liab ? vaultBal - liab : 0;
+        uint256 maxRefund  = surplus < 500e6 ? surplus : 500e6;
+        refundAmount       = bound(refundAmount, 0, maxRefund);
+
+        newLiabilityFraction = bound(newLiabilityFraction, 0, 100);
+        uint256 newLiab      = (info.riskBudget * newLiabilityFraction) / 100;
+        uint256 oldLiab      = info.currentLiability;
+
+        address _trader = address(uint160(uint256(keccak256("trader"))));
+
+        try m.doDistributeRefund(_trader, refundAmount, newLiab) {
+            // Sync ghost: same capped-delta logic as the vault
+            uint256 capped = newLiab > info.riskBudget ? info.riskBudget : newLiab;
+            if (capped < oldLiab) {
+                ghost_expectedTotalLiability -= (oldLiab - capped);
+            } else if (capped > oldLiab) {
+                ghost_expectedTotalLiability += (capped - oldLiab);
+            }
+        } catch {}
+    }
+
     /*//////////////////////////////////////////////////////////////
              HANDLER — SETTLEMENT FLOW
     //////////////////////////////////////////////////////////////*/
