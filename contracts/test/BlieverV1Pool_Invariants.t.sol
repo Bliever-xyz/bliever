@@ -154,10 +154,10 @@ contract PoolHandler is CommonBase, StdCheats, StdUtils {
         BlieverV1Pool.MarketInfo memory info = pool.getMarketInfo(address(m));
         if (!info.registered || info.settled || info.hasTrades) return;
 
-        uint256 riskBefore = info.riskBudget;
+        uint256 liabBefore = info.currentLiability;
         vm.prank(admin);
         try pool.deregisterMarket(address(m)) {
-            ghost_expectedTotalLiability -= riskBefore;
+            ghost_expectedTotalLiability -= liabBefore;
             ghost_activeMarketCount      -= 1;
         } catch {}
     }
