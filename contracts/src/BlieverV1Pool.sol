@@ -455,10 +455,10 @@ contract BlieverV1Pool is
         if ( info.settled)     revert MarketAlreadySettled(market);
         if ( info.hasTrades)   revert MarketHasTrades(market);
 
-        uint256 risk = info.riskBudget;
+        uint256 liab = info.currentLiability;
 
         // ── Effects ─────────────────────────────────────────────────────────
-        totalLiability -= risk;
+        totalLiability -= liab;
 
         --activeMarketCount; // reverts on underflow, surfacing any accounting bug
 
