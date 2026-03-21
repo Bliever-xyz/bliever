@@ -252,6 +252,12 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     ///         Determines price sensitivity and worst-case loss bound.
     uint256 public alpha;
 
+    // ── Slot F ── (20 bytes — USDC token address, padded to 32)
+    /// @notice USDC token address, fetched from `pool.asset()` exactly once during
+    ///         `initialize()` and cached here.  Eliminates a live external call to the
+    ///         pool on every permit-path `buy()` and on every `usdcToken()` view call.
+    address public usdc;
+
     // ── Dynamic Array Slots ───────────────────────────────────────────────────
 
     /// @notice Current AMM quantity vector q (18-dec).
@@ -382,6 +388,7 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         resolutionDeadline = _resolutionDeadline;
         resolver           = _resolver;
         factory            = _factory;
+        usdc               = IBlieverV1Pool(_pool).asset();  // cache once — no live call in hot path
 
         // ── Seed the AMM with the symmetric initial quantity vector q⁰ ───────
         // All n outcomes initialised to ε (uniform prior, positive orthant entry point).
@@ -487,21 +494,10 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         uint256 newLiability18   = LSMath.calculateWorstCaseLoss(qNew, q0, _alpha);
         uint256 newLiabilityUsdc = _floorToUsdc(newLiability18);
 
-        // ── Optional EIP-2612 Permit ─────────────────────────────────────────
-        // Attempt permit only when a real signature is supplied (v != 0).
-        // If the nonce was already consumed by a front-runner, fall back silently
-        // to any allowance the trader already holds rather than reverting the buy.
-        if (v != 0) {
-            address _usdc = IBlieverV1Pool(pool).asset();
-            try IERC20Permit(_usdc).permit(
-                msg.sender, pool, maxCostUsdc, deadline, v, r, s
-            ) {} catch {
-                if (IERC20(_usdc).allowance(msg.sender, pool) < maxCostUsdc)
-                    revert InsufficientPermitAllowance();
-            }
-        }
-
-        // ── Effects: Update AMM & Internal Ledger (CEI pattern) ─────────────
+        // ── Effects: Update AMM & Internal Ledger (CEI — before any external call) ──
+        // State is committed here, before both the optional permit call and the pool
+        // interaction below.  If either external call re-enters (blocked by nonReentrant)
+        // or reverts, Solidity unwinds all writes — no partial-state corruption is possible.
         // Only the single mutated slot is written back to storage.
         // All other n-1 slots are unchanged — no wasted SSTOREs.
         _quantities[outcomeIndex] += shareAmount;
@@ -509,6 +505,20 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         // Credit shares to internal ledger (non-transferable).
         _shares[msg.sender][outcomeIndex] += shareAmount;
         _totalTraderShares[outcomeIndex]  += shareAmount;
+
+        // ── Optional EIP-2612 Permit ─────────────────────────────────────────
+        // Attempted only when a real signature is supplied (v != 0).
+        // Uses the `usdc` slot cached at initialization — zero external calls here.
+        // If the nonce was already consumed by a front-runner, fall back silently
+        // to any allowance the trader already holds rather than reverting the buy.
+        if (v != 0) {
+            try IERC20Permit(usdc).permit(
+                msg.sender, pool, maxCostUsdc, deadline, v, r, s
+            ) {} catch {
+                if (IERC20(usdc).allowance(msg.sender, pool) < maxCostUsdc)
+                    revert InsufficientPermitAllowance();
+            }
+        }
 
         // ── Interactions: Route USDC Collection to Vault ─────────────────────
         // Vault pulls cost_usdc from trader (trader must have approved vault).
@@ -993,9 +1003,9 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         return LSMath.sumOfPrices(_loadQuantities(outcomeCount), alpha);
     }
 
-    /// @notice USDC token address (fetched from pool to avoid redundant storage).
+    /// @notice USDC token address (cached from pool at initialization — no external call).
     function usdcToken() external view returns (address) {
-        return IBlieverV1Pool(pool).asset();
+        return usdc;
     }
 
     /// @notice True if the trader has already claimed their winnings.
