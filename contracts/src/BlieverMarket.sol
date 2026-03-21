@@ -11,6 +11,8 @@ import {PausableUpgradeable}  from "@openzeppelin/contracts-upgradeable/utils/Pa
                     OPENZEPPELIN — STANDARD
 //////////////////////////////////////////////////////////////*/
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import {IERC20}                   from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Permit}             from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
 
 /*//////////////////////////////////////////////////////////////
                     INTERNAL
@@ -88,6 +90,11 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     /// @notice LSMath fixed-point scale (1e18).  Imported explicitly for readability.
     uint256 internal constant MATH_SCALE = 1e18;
 
+    /// @notice Minimum share amount accepted by buy() and sell() (18-dec).
+    ///         Prevents dust positions that consume an SSTORE and emit an event for an
+    ///         economically negligible amount.  0.001 shares = 1e15 units (18-dec).
+    uint256 internal constant MIN_SHARE_AMOUNT = 1e15;
+
     /*//////////////////////////////////////////////////////////////
                                ERRORS
     //////////////////////////////////////////////////////////////*/
@@ -134,6 +141,10 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     error NegativeBuyCost();
     /// @notice Payout is too small to express in USDC (< 1 USDC-wei = 1 unit of 6-dec)
     error PayoutBelowMinimum();
+    /// @notice share amount is below MIN_SHARE_AMOUNT (dust-trade guard)
+    error ShareAmountTooSmall(uint256 amount, uint256 minimum);
+    /// @notice Permit signature was consumed (front-run) and existing allowance is insufficient
+    error InsufficientPermitAllowance();
 
     /*//////////////////////////////////////////////////////////////
                                EVENTS
@@ -413,35 +424,50 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     ///            Always > 0 for a buy: C is monotonically increasing in each qi.
     ///         4. cost_usdc  = ⌈cost_18dec / SHARE_TO_USDC⌉  (ceiling — vault protective).
     ///         5. newLiability = calculateWorstCaseLoss(q_new, q⁰, α) / SHARE_TO_USDC.
-    ///         6. Write q_new to storage, credit shares to internal ledger.
+    ///         6. Write q_new[outcomeIndex] to storage (single slot), credit shares to ledger.
     ///         7. Call pool.collectTradeCost(trader, cost_usdc, newLiability_usdc).
     ///            The vault pulls cost_usdc USDC from trader (trader must approve VAULT).
     ///
-    ///         ⚠️  APPROVAL: The trader must pre-approve the BlieverV1Pool address
-    ///             (not this contract) for ≥ maxCostUsdc USDC before calling buy().
+    ///         ── Permit (optional) ──────────────────────────────────────────────
+    ///         Pass `v != 0` to attempt an EIP-2612 permit before the transfer.
+    ///         If the permit signature has already been consumed (e.g. front-run griefing),
+    ///         the call falls back silently to any pre-existing allowance the trader holds.
+    ///         Pass `v = 0, r = 0, s = 0, deadline = 0` to skip the permit attempt entirely
+    ///         and rely on a pre-existing `USDC.approve(pool, amount)` call.
+    ///
+    ///        
+    ///             (not this contract) for ≥ maxCostUsdc USDC before calling buy(),
+    ///             OR supply a valid permit signature via the v/r/s/deadline parameters.
     ///
     /// @param outcomeIndex  Outcome to purchase shares of [0, outcomeCount)
-    /// @param shareAmount   Shares to buy (18-dec, > 0)
+    /// @param shareAmount   Shares to buy (18-dec, ≥ MIN_SHARE_AMOUNT)
     /// @param maxCostUsdc   Maximum USDC the trader will pay (6-dec); slippage guard
+    /// @param deadline      EIP-2612 permit deadline (0 = skip permit)
+    /// @param v             EIP-2612 permit signature v (0 = skip permit)
+    /// @param r             EIP-2612 permit signature r
+    /// @param s             EIP-2612 permit signature s
     function buy(
         uint256 outcomeIndex,
         uint256 shareAmount,
-        uint256 maxCostUsdc
+        uint256 maxCostUsdc,
+        uint256 deadline,
+        uint8   v,
+        bytes32 r,
+        bytes32 s
     ) external nonReentrant whenNotPaused tradingOpen {
         // ── Pre-condition Checks ─────────────────────────────────────────────
-        if (shareAmount == 0)            revert ZeroAmount();
-        if (outcomeIndex >= outcomeCount) revert InvalidOutcomeIndex(outcomeIndex, outcomeCount);
+        if (shareAmount < MIN_SHARE_AMOUNT)  revert ShareAmountTooSmall(shareAmount, MIN_SHARE_AMOUNT);
+        if (outcomeIndex >= outcomeCount)     revert InvalidOutcomeIndex(outcomeIndex, outcomeCount);
 
-        // ── Load AMM State into Memory ───────────────────────────────────────
-        uint256 n        = outcomeCount;
-        uint256 _alpha   = alpha;
+        // ── Load AMM State into Memory (single combined loop) ────────────────
+        // _loadQuantitiesForBuy reads all n slots once and returns both qOld and qNew,
+        // with qNew[outcomeIndex] already incremented by shareAmount.  This replaces the
+        // previous separate _loadQuantities + _copyArray pass (2 loops → 1 loop).
+        uint256 n      = outcomeCount;
+        uint256 _alpha = alpha;
 
-        uint256[] memory qOld = _loadQuantities(n);
-        uint256[] memory qNew = _copyArray(qOld, n);
-
-        // ── Compute q_new for a simple buy ───────────────────────────────────
-        // No CSS translation for buys: adding to a specific outcome is always valid.
-        qNew[outcomeIndex] += shareAmount;
+        (uint256[] memory qOld, uint256[] memory qNew) =
+            _loadQuantitiesForBuy(n, outcomeIndex, shareAmount);
 
         // ── Cost Calculation (18-dec → 6-dec USDC) ──────────────────────────
         int256 tradeCost18 = LSMath.calculateTradeCost(qOld, qNew, _alpha);
@@ -457,17 +483,32 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         if (costUsdc > maxCostUsdc) revert SlippageExceeded(costUsdc, maxCostUsdc);
 
         // ── Compute Updated Vault Liability ──────────────────────────────────
-        uint256[] memory q0        = _loadInitialQuantities(n);
-        uint256 newLiability18     = LSMath.calculateWorstCaseLoss(qNew, q0, _alpha);
-        uint256 newLiabilityUsdc   = _floorToUsdc(newLiability18);
+        uint256[] memory q0      = _loadInitialQuantities(n);
+        uint256 newLiability18   = LSMath.calculateWorstCaseLoss(qNew, q0, _alpha);
+        uint256 newLiabilityUsdc = _floorToUsdc(newLiability18);
+
+        // ── Optional EIP-2612 Permit ─────────────────────────────────────────
+        // Attempt permit only when a real signature is supplied (v != 0).
+        // If the nonce was already consumed by a front-runner, fall back silently
+        // to any allowance the trader already holds rather than reverting the buy.
+        if (v != 0) {
+            address _usdc = IBlieverV1Pool(pool).asset();
+            try IERC20Permit(_usdc).permit(
+                msg.sender, pool, maxCostUsdc, deadline, v, r, s
+            ) {} catch {
+                if (IERC20(_usdc).allowance(msg.sender, pool) < maxCostUsdc)
+                    revert InsufficientPermitAllowance();
+            }
+        }
 
         // ── Effects: Update AMM & Internal Ledger (CEI pattern) ─────────────
-        // Write new q-vector before any external call.
-        _storeQuantities(qNew, n);
+        // Only the single mutated slot is written back to storage.
+        // All other n-1 slots are unchanged — no wasted SSTOREs.
+        _quantities[outcomeIndex] += shareAmount;
 
         // Credit shares to internal ledger (non-transferable).
-        _shares[msg.sender][outcomeIndex]   += shareAmount;
-        _totalTraderShares[outcomeIndex]    += shareAmount;
+        _shares[msg.sender][outcomeIndex] += shareAmount;
+        _totalTraderShares[outcomeIndex]  += shareAmount;
 
         // ── Interactions: Route USDC Collection to Vault ─────────────────────
         // Vault pulls cost_usdc from trader (trader must have approved vault).
@@ -517,8 +558,8 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         uint256 minRefundUsdc
     ) external nonReentrant whenNotPaused tradingOpen {
         // ── Pre-condition Checks ─────────────────────────────────────────────
-        if (shareAmount == 0)            revert ZeroAmount();
-        if (outcomeIndex >= outcomeCount) revert InvalidOutcomeIndex(outcomeIndex, outcomeCount);
+        if (shareAmount < MIN_SHARE_AMOUNT)  revert ShareAmountTooSmall(shareAmount, MIN_SHARE_AMOUNT);
+        if (outcomeIndex >= outcomeCount)     revert InvalidOutcomeIndex(outcomeIndex, outcomeCount);
 
         address trader = msg.sender;
         uint256 n      = outcomeCount;
@@ -1045,6 +1086,30 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         dst = new uint256[](n);
         for (uint256 i = 0; i < n;) {
             dst[i] = src[i];
+            unchecked { ++i; }
+        }
+    }
+
+    /// @dev Load the current quantity vector and simultaneously produce q_new for a buy,
+    ///      incrementing only the single changed index.  Replaces the two-step pattern of
+    ///      _loadQuantities(n) followed by _copyArray(qOld, n) + mutation, cutting the
+    ///      memory traversal from two passes to one.
+    /// @param n     Number of outcomes (= outcomeCount, cached by caller)
+    /// @param idx   The outcome index being purchased
+    /// @param delta The share amount being added (= shareAmount, 18-dec)
+    /// @return qOld Current quantity vector snapshot (all n slots, unmodified)
+    /// @return qNew New quantity vector after the buy (qOld[idx] + delta at position idx)
+    function _loadQuantitiesForBuy(uint256 n, uint256 idx, uint256 delta)
+        internal
+        view
+        returns (uint256[] memory qOld, uint256[] memory qNew)
+    {
+        qOld = new uint256[](n);
+        qNew = new uint256[](n);
+        for (uint256 i = 0; i < n;) {
+            uint256 q = _quantities[i];
+            qOld[i] = q;
+            qNew[i] = (i == idx) ? q + delta : q;
             unchecked { ++i; }
         }
     }
