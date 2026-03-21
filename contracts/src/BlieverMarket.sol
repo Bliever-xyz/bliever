@@ -270,15 +270,6 @@ contract BlieverMarket is Initializable, ReentrancyGuardUpgradeable, PausableUpg
     mapping(address => bool) internal _claimed;
 
     /*//////////////////////////////////////////////////////////////
-                     GAP — FUTURE STATE VARIABLES
-    //////////////////////////////////////////////////////////////*/
-
-    /// @dev Reserve storage for future non-breaking additions.
-    ///      Reduce by 1 for each new state variable added in a future upgrade
-    ///      to the master implementation (and re-clone all markets if storage grows).
-    uint256[45] private __gap;
-
-    /*//////////////////////////////////////////////////////////////
                             CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
