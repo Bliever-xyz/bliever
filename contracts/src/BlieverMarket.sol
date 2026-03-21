@@ -4,15 +4,13 @@ pragma solidity 0.8.31;
 /*//////////////////////////////////////////////////////////////
                     OPENZEPPELIN — UPGRADEABLE
 //////////////////////////////////////////////////////////////*/
-import {Initializable}              from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import {PausableUpgradeable}        from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
-import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {Initializable}        from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {PausableUpgradeable}  from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 
 /*//////////////////////////////////////////////////////////////
                     OPENZEPPELIN — STANDARD
 //////////////////////////////////////////////////////////////*/
-import {IERC20}    from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 
 /*//////////////////////////////////////////////////////////////
                     INTERNAL
@@ -72,10 +70,11 @@ import {IBlieverV1Pool} from "./interfaces/IBlieverV1Pool.sol";
 ///         • All storage mutated after `initialize()` lives in the CLONE's storage.
 ///         • The master's code is shared but never executes with its own storage.
 ///
-/// @dev    Inheritance stack: Initializable → ReentrancyGuardUpgradeable → PausableUpgradeable.
+/// @dev    Inheritance stack: Initializable → ReentrancyGuardTransient → PausableUpgradeable.
 ///         No UUPS upgrade logic — clones are immutable by design (security requirement).
-contract BlieverMarket is Initializable, ReentrancyGuardUpgradeable, PausableUpgradeable {
-    using SafeERC20 for IERC20;
+///         ReentrancyGuardTransient uses EIP-1153 transient storage: no persistent slot consumed
+///         and no initialiser call required, saving ~2 000 gas on every guarded function.
+contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgradeable {
 
     /*//////////////////////////////////////////////////////////////
                               CONSTANTS
@@ -360,7 +359,7 @@ contract BlieverMarket is Initializable, ReentrancyGuardUpgradeable, PausableUpg
         if (_resolutionDeadline <= _tradingDeadline)       revert InvalidDeadlines();
 
         // ── OpenZeppelin Upgradeable Initialisers ────────────────────────────
-        __ReentrancyGuard_init();
+        // ReentrancyGuardTransient uses EIP-1153 transient storage — no init call needed.
         __Pausable_init();
 
         // ── Config (write once) ──────────────────────────────────────────────
