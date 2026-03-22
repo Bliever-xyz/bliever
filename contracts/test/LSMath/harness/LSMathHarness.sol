@@ -110,4 +110,20 @@ contract LSMathHarness {
     ) external pure returns (bool hasProfit, uint256 profit) {
         return LSMath.hasOutcomeIndependentProfit(quantities, initialQuantities, alpha);
     }
+
+    function calculateTradeCostDetailed(
+        uint256[] memory quantitiesFrom,
+        uint256[] memory quantitiesTo,
+        uint256 alpha
+    ) external pure returns (int256 tradeCost, uint256 costTo) {
+        return LSMath.calculateTradeCostDetailed(quantitiesFrom, quantitiesTo, alpha);
+    }
+
+    function calculateWorstCaseLossFromCosts(
+        uint256 costCurrent,
+        uint256 costInitial,
+        uint256[] memory quantities
+    ) external pure returns (uint256 worstCaseLoss) {
+        return LSMath.calculateWorstCaseLossFromCosts(costCurrent, costInitial, quantities);
+    }
 }
