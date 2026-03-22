@@ -311,20 +311,24 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
 
     /// @dev Reverts if trading is no longer permitted.
     ///      Trading closes at tradingDeadline OR when the market is resolved.
+    ///      Logic is delegated to _tradingOpen() so the compiler emits the check
+    ///      body once rather than inlining it at every call site (code-size saving).
     modifier tradingOpen() {
-        if (resolved || block.timestamp > tradingDeadline) revert TradingClosed();
+        _tradingOpen();
         _;
     }
 
     /// @dev Reverts if the caller is not the Resolution Adapter.
+    ///      Logic delegated to _onlyResolver() for code-size efficiency.
     modifier onlyResolver() {
-        if (msg.sender != resolver) revert NotResolver();
+        _onlyResolver();
         _;
     }
 
     /// @dev Reverts if the caller is not the Market Factory.
+    ///      Logic delegated to _onlyFactory() for code-size efficiency.
     modifier onlyFactory() {
-        if (msg.sender != factory) revert NotFactory();
+        _onlyFactory();
         _;
     }
 
@@ -502,6 +506,9 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         if (tradeCost18 < 0) revert NegativeBuyCost();
 
         // Convert to USDC, rounding UP to protect the vault.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        // casting to 'uint256' is safe because tradeCost18 >= 0 is proven by the
+        // NegativeBuyCost revert directly above; the int256 → uint256 cast cannot truncate.
         uint256 costUsdc = _ceilToUsdc(uint256(tradeCost18));
 
         // ── Slippage Guard ───────────────────────────────────────────────────
@@ -651,6 +658,11 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
 
         // ── Determine Refund or Payment ──────────────────────────────────────
         bool isRefund = (tradeCost18 < 0);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        // casting to 'uint256' is safe on both branches:
+        //   isRefund branch: tradeCost18 < 0, so -tradeCost18 > 0; negation of a negative
+        //     int256 that fits in uint256 (LSMath bounds cost values well below int256.max).
+        //   !isRefund branch: tradeCost18 >= 0 by definition; int256 → uint256 is lossless.
         uint256 absAmount18   = isRefund ? uint256(-tradeCost18) : uint256(tradeCost18);
         // Refund: floor conversion (vault keeps more). Payment: ceil (vault collects more).
         uint256 absAmountUsdc = isRefund ? _floorToUsdc(absAmount18) : _ceilToUsdc(absAmount18);
@@ -917,6 +929,9 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
 
         int256 cost18 = LSMath.calculateTradeCost(qOld, qNew, alpha);
         if (cost18 < 0) return 0; // should not happen for a pure buy
+        // forge-lint: disable-next-line(unsafe-typecast)
+        // casting to 'uint256' is safe because cost18 >= 0 is enforced by the early
+        // return directly above; the int256 → uint256 cast cannot truncate.
         costUsdc = _ceilToUsdc(uint256(cost18));
     }
 
@@ -958,8 +973,13 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
 
         int256 tradeCost18 = LSMath.calculateTradeCost(qOld, qNew, alpha);
         if (tradeCost18 < 0) {
+            // forge-lint: disable-next-line(unsafe-typecast)
+            // casting to 'uint256' is safe: tradeCost18 < 0 guarantees -tradeCost18 > 0
+            // and LSMath bounds cost magnitudes well within uint256 range.
             refundUsdc = _floorToUsdc(uint256(-tradeCost18));
         } else {
+            // forge-lint: disable-next-line(unsafe-typecast)
+            // casting to 'uint256' is safe: else-branch guarantees tradeCost18 >= 0.
             costUsdc = _ceilToUsdc(uint256(tradeCost18));
         }
     }
@@ -1066,6 +1086,32 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
 
     /*//////////////////////////////////////////////////////////////
                           INTERNAL HELPERS
+    //////////////////////////////////////////////////////////////*/
+
+    /*//////////////////////////////////////////////////////////////
+                      INTERNAL — MODIFIER BODIES
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Extracted body of the `tradingOpen` modifier.
+    ///      Extracting to an internal function means the compiler emits this
+    ///      bytecode once; each modifier call-site jumps here instead of
+    ///      receiving an inlined copy, reducing overall contract code size.
+    function _tradingOpen() internal view {
+        if (resolved || block.timestamp > tradingDeadline) revert TradingClosed();
+    }
+
+    /// @dev Extracted body of the `onlyResolver` modifier.
+    function _onlyResolver() internal view {
+        if (msg.sender != resolver) revert NotResolver();
+    }
+
+    /// @dev Extracted body of the `onlyFactory` modifier.
+    function _onlyFactory() internal view {
+        if (msg.sender != factory) revert NotFactory();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                      INTERNAL — QUANTITY HELPERS
     //////////////////////////////////////////////////////////////*/
 
     /// @dev Load the current quantity vector from storage into a fresh memory array.
