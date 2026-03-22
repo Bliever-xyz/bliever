@@ -591,4 +591,57 @@ contract LSMathCostAndPricingTest is Test {
 
         assertEq(fromCosts, fromVectors, "fuzz: fromCosts must equal calculateWorstCaseLoss");
     }
+
+    /*//////////////////////////////////////////////////////////////
+                MULTI-OUTCOME TESTS (n > 2)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev calculateTradeCostDetailed on a real 5-outcome market:
+    ///      tradeCost and costTo must match their reference functions.
+    function test_calculateTradeCostDetailed_five_outcome_consistency() public view {
+        uint256[] memory qFrom = _uniform(5, 50e18);
+        uint256[] memory qTo   = _uniform(5, 50e18);
+        qTo[2] = 120e18; // buy 70 shares on outcome 2
+
+        int256  expectedTradeCost = h.calculateTradeCost(qFrom, qTo, ALPHA_5);
+        uint256 expectedCostTo    = h.costFunction(qTo, ALPHA_5);
+
+        (int256 tradeCost, uint256 costTo) = h.calculateTradeCostDetailed(qFrom, qTo, ALPHA_5);
+
+        assertEq(tradeCost, expectedTradeCost, "5-outcome: tradeCost must match calculateTradeCost");
+        assertEq(costTo,    expectedCostTo,    "5-outcome: costTo must match costFunction(qTo)");
+    }
+
+    /// @dev calculateWorstCaseLossFromCosts on a real 5-outcome market must match
+    ///      calculateWorstCaseLoss — verifies maxQ scan across all 5 elements.
+    function test_calculateWorstCaseLossFromCosts_five_outcome_consistency() public view {
+        uint256[] memory qInit = _uniform(5, 10e18);
+        uint256[] memory qCurr = _uniform(5, 10e18);
+        qCurr[3] = 80e18; // outcome 3 is dominant
+
+        uint256 costCurrent = h.costFunction(qCurr, ALPHA_5);
+        uint256 costInitial = h.costFunction(qInit, ALPHA_5);
+
+        uint256 fromCosts   = h.calculateWorstCaseLossFromCosts(costCurrent, costInitial, qCurr);
+        uint256 fromVectors = h.calculateWorstCaseLoss(qCurr, qInit, ALPHA_5);
+
+        assertEq(fromCosts, fromVectors, "5-outcome: fromCosts must equal calculateWorstCaseLoss");
+    }
+
+    /// @dev End-to-end 5-outcome workflow: calculateTradeCostDetailed → calculateWorstCaseLossFromCosts
+    ///      must match calculateWorstCaseLoss, confirming the production LP vault pattern at n=5.
+    function test_multi_outcome_integration_workflow() public view {
+        uint256[] memory qInit = _uniform(5, 10e18);
+        uint256[] memory qCurr = _uniform(5, 10e18);
+        qCurr[0] = 90e18;
+        qCurr[4] = 5e18;
+
+        (, uint256 costTo)  = h.calculateTradeCostDetailed(qInit, qCurr, ALPHA_5);
+        uint256 costInitial = h.costFunction(qInit, ALPHA_5);
+
+        uint256 lossFromWorkflow = h.calculateWorstCaseLossFromCosts(costTo, costInitial, qCurr);
+        uint256 lossFromVectors  = h.calculateWorstCaseLoss(qCurr, qInit, ALPHA_5);
+
+        assertEq(lossFromWorkflow, lossFromVectors, "5-outcome workflow must match calculateWorstCaseLoss");
+    }
 }
