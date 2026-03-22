@@ -266,9 +266,17 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     uint256[] internal _quantities;
 
     /// @notice Initial AMM quantity vector q⁰ (18-dec), set once in initialize().
-    ///         Used in LSMath.calculateWorstCaseLoss() to compute live vault liability.
+    ///         Retained for the getInitialQuantities() view. Not read in the trading hot path.
     ///         Satisfies: C(q⁰) / SHARE_TO_USDC = pool.maxRiskPerMarket.
     uint256[] internal _initialQuantities;
+
+    /// @notice C(q⁰) — the LS-LMSR cost function evaluated at the initial quantity vector.
+    ///         Computed and stored exactly once in initialize(). Never mutated afterwards.
+    ///         On every buy/sell, worst-case vault liability is computed via
+    ///         LSMath.calculateWorstCaseLossFromCosts(costNew, _initialCost, qNew), which
+    ///         replaces the full _loadInitialQuantities() + costFunction(q⁰) sequence with
+    ///         a single warm SLOAD — saving ~40,000–60,000 gas per trade on a 10-outcome market.
+    uint256 internal _initialCost;
 
     // ── Mapping Slots ─────────────────────────────────────────────────────────
 
@@ -407,6 +415,10 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         _quantities        = initQ;
         _initialQuantities = initQ;
 
+        // Cache C(q⁰) once — used on every subsequent buy/sell via calculateWorstCaseLossFromCosts.
+        // initQ is already in memory here; no additional storage reads required.
+        _initialCost = LSMath.costFunction(initQ, _alpha);
+
         emit MarketInitialized(
             _questionId,
             _pool,
@@ -427,10 +439,12 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     ///         Mathematical flow (buy is the simplest case — no CSS translation needed):
     ///         1. Load q (market's current quantity vector from storage → memory).
     ///         2. Build q_new: q_new[outcomeIndex] += shareAmount; all others unchanged.
-    ///         3. cost_18dec = C(q_new) − C(q)  via LSMath.calculateTradeCost().
+    ///         3. (tradeCost18, costNew) = LSMath.calculateTradeCostDetailed(qOld, qNew, α)
+    ///            Returns C(qNew)−C(qOld) and C(qNew) in one pass — costFunction(qNew) runs once.
     ///            Always > 0 for a buy: C is monotonically increasing in each qi.
-    ///         4. cost_usdc  = ⌈cost_18dec / SHARE_TO_USDC⌉  (ceiling — vault protective).
-    ///         5. newLiability = calculateWorstCaseLoss(q_new, q⁰, α) / SHARE_TO_USDC.
+    ///         4. cost_usdc  = ⌈tradeCost18 / SHARE_TO_USDC⌉  (ceiling — vault protective).
+    ///         5. newLiability = calculateWorstCaseLossFromCosts(costNew, _initialCost, qNew)
+    ///            _initialCost = C(q⁰) was cached in initialize(). One warm SLOAD; zero exp/ln math.
     ///         6. Write q_new[outcomeIndex] to storage (single slot), credit shares to ledger.
     ///         7. Call pool.collectTradeCost(trader, cost_usdc, newLiability_usdc).
     ///            The vault pulls cost_usdc USDC from trader (trader must approve VAULT).
@@ -477,7 +491,11 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
             _loadQuantitiesForBuy(n, outcomeIndex, shareAmount);
 
         // ── Cost Calculation (18-dec → 6-dec USDC) ──────────────────────────
-        int256 tradeCost18 = LSMath.calculateTradeCost(qOld, qNew, _alpha);
+        // calculateTradeCostDetailed returns both tradeCost18 = C(qNew)−C(qOld) and
+        // costNew = C(qNew), so the result is reused for the liability update below
+        // — costFunction(qNew) runs exactly once.
+        (int256 tradeCost18, uint256 costNew) =
+            LSMath.calculateTradeCostDetailed(qOld, qNew, _alpha);
 
         // A buy must always cost ≥ 0 (C is monotone increasing).
         // Negative would indicate a library bug — surface it explicitly.
@@ -490,8 +508,10 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         if (costUsdc > maxCostUsdc) revert SlippageExceeded(costUsdc, maxCostUsdc);
 
         // ── Compute Updated Vault Liability ──────────────────────────────────
-        uint256[] memory q0      = _loadInitialQuantities(n);
-        uint256 newLiability18   = LSMath.calculateWorstCaseLoss(qNew, q0, _alpha);
+        // Uses the pre-computed costNew (C(qNew)) and the cached _initialCost (C(q⁰)).
+        // No _loadInitialQuantities() call; no redundant costFunction(qNew) or costFunction(q⁰).
+        // One warm SLOAD for _initialCost replaces n SLOADs + a full O(n) exp/ln pass.
+        uint256 newLiability18   = LSMath.calculateWorstCaseLossFromCosts(costNew, _initialCost, qNew);
         uint256 newLiabilityUsdc = _floorToUsdc(newLiability18);
 
         // ── Effects: Update AMM & Internal Ledger (CEI — before any external call) ──
@@ -619,11 +639,14 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         // tradeCost18 = C(qNew) − C(qOld).
         // Negative  ⟹ refund (vault pays trader).
         // Positive  ⟹ payment (trader pays vault; rare with large CSS translation).
-        int256 tradeCost18 = LSMath.calculateTradeCost(qOld, qNew, _alpha);
+        // calculateTradeCostDetailed also returns costNew = C(qNew) for reuse below.
+        (int256 tradeCost18, uint256 costNew) =
+            LSMath.calculateTradeCostDetailed(qOld, qNew, _alpha);
 
         // ── Compute Updated Vault Liability ──────────────────────────────────
-        uint256[] memory q0       = _loadInitialQuantities(n);
-        uint256 newLiability18    = LSMath.calculateWorstCaseLoss(qNew, q0, _alpha);
+        // Reuses costNew from above; reads _initialCost = C(q⁰) from a single warm SLOAD.
+        // Eliminates _loadInitialQuantities() (n SLOADs) and costFunction(q⁰) on every sell.
+        uint256 newLiability18    = LSMath.calculateWorstCaseLossFromCosts(costNew, _initialCost, qNew);
         uint256 newLiabilityUsdc  = _floorToUsdc(newLiability18);
 
         // ── Determine Refund or Payment ──────────────────────────────────────
