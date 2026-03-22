@@ -381,4 +381,214 @@ contract LSMathCostAndPricingTest is Test {
 
         assertGe(cost, maxQ, "C(q) must be >= max(qi) (Lemma 4.5)");
     }
+
+    /*//////////////////////////////////////////////////////////////
+               calculateTradeCostDetailed() — HAPPY PATH
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev tradeCost returned by the detailed variant must equal calculateTradeCost()
+    ///      for the same inputs.  The two functions share identical cost arithmetic.
+    function test_calculateTradeCostDetailed_tradeCost_matches_calculateTradeCost() public view {
+        uint256[] memory qFrom = _binary(100e18, 100e18);
+        uint256[] memory qTo   = _binary(150e18, 100e18);
+
+        int256 expected = h.calculateTradeCost(qFrom, qTo, ALPHA_5);
+        (int256 tradeCost, ) = h.calculateTradeCostDetailed(qFrom, qTo, ALPHA_5);
+
+        assertEq(tradeCost, expected, "tradeCost must match calculateTradeCost");
+    }
+
+    /// @dev The second return value costTo must equal a direct costFunction(qTo) call.
+    ///      This is the gas-saving reuse value; correctness is essential.
+    function test_calculateTradeCostDetailed_costTo_matches_costFunction() public view {
+        uint256[] memory qFrom = _binary(80e18, 120e18);
+        uint256[] memory qTo   = _binary(130e18, 120e18);
+
+        uint256 expectedCostTo = h.costFunction(qTo, ALPHA_5);
+        (, uint256 costTo) = h.calculateTradeCostDetailed(qFrom, qTo, ALPHA_5);
+
+        assertEq(costTo, expectedCostTo, "costTo must equal costFunction(qTo)");
+    }
+
+    /// @dev Buying shares increases obligations → C(qTo) > C(qFrom) → tradeCost > 0
+    function test_calculateTradeCostDetailed_positive_on_buy() public view {
+        uint256[] memory qFrom = _binary(100e18, 100e18);
+        uint256[] memory qTo   = _binary(150e18, 100e18); // bought 50 shares of outcome 0
+
+        (int256 tradeCost, ) = h.calculateTradeCostDetailed(qFrom, qTo, ALPHA_5);
+
+        assertGt(tradeCost, 0, "buying must produce a positive trade cost");
+    }
+
+    /// @dev No-op trade (qFrom == qTo) must produce zero cost and correct costTo.
+    function test_calculateTradeCostDetailed_zero_on_noop() public view {
+        uint256[] memory q = _binary(100e18, 100e18);
+
+        (int256 tradeCost, uint256 costTo) = h.calculateTradeCostDetailed(q, q, ALPHA_5);
+        uint256 expectedCost = h.costFunction(q, ALPHA_5);
+
+        assertEq(tradeCost, 0,            "no-op trade cost must be zero");
+        assertEq(costTo, expectedCost,    "no-op costTo must equal costFunction(q)");
+    }
+
+    /// @dev Mismatched array lengths must revert — same guard as calculateTradeCost
+    function test_calculateTradeCostDetailed_reverts_array_length_mismatch() public {
+        uint256[] memory qFrom = _binary(100e18, 100e18);
+        uint256[] memory qTo   = _uniform(3, 100e18); // length 3 vs 2
+
+        vm.expectRevert(LSMath.InvalidOutcomeIndex.selector);
+        h.calculateTradeCostDetailed(qFrom, qTo, ALPHA_5);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+           calculateTradeCostDetailed() — FUZZ
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev For any valid binary trade, tradeCost must match calculateTradeCost
+    ///      and costTo must match a standalone costFunction call.
+    function testFuzz_calculateTradeCostDetailed_consistent(
+        uint256 q0From, uint256 q1From,
+        uint256 q0To,   uint256 q1To,
+        uint256 alpha
+    ) public view {
+        alpha  = bound(alpha,  5e16,  2e17);
+        q0From = bound(q0From, 1e15,  1e25);
+        q1From = bound(q1From, 1e15,  1e25);
+        q0To   = bound(q0To,   1e15,  1e25);
+        q1To   = bound(q1To,   1e15,  1e25);
+
+        uint256[] memory qFrom = _binary(q0From, q1From);
+        uint256[] memory qTo   = _binary(q0To,   q1To);
+
+        int256  expectedTradeCost = h.calculateTradeCost(qFrom, qTo, alpha);
+        uint256 expectedCostTo    = h.costFunction(qTo, alpha);
+
+        (int256 tradeCost, uint256 costTo) = h.calculateTradeCostDetailed(qFrom, qTo, alpha);
+
+        assertEq(tradeCost, expectedTradeCost, "fuzz: tradeCost must match calculateTradeCost");
+        assertEq(costTo,    expectedCostTo,    "fuzz: costTo must match costFunction(qTo)");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+            calculateWorstCaseLossFromCosts() — HAPPY PATH
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Must produce identical output to calculateWorstCaseLoss() when given
+    ///      the same pre-computed cost values.  Core consistency guarantee.
+    function test_calculateWorstCaseLossFromCosts_matches_calculateWorstCaseLoss() public view {
+        uint256[] memory qInit = _binary(10e18, 10e18);
+        uint256[] memory qCurr = _binary(60e18, 40e18);
+
+        uint256 costCurrent = h.costFunction(qCurr, ALPHA_5);
+        uint256 costInitial = h.costFunction(qInit, ALPHA_5);
+
+        uint256 fromCosts  = h.calculateWorstCaseLossFromCosts(costCurrent, costInitial, qCurr);
+        uint256 fromVectors = h.calculateWorstCaseLoss(qCurr, qInit, ALPHA_5);
+
+        assertEq(fromCosts, fromVectors, "fromCosts must equal calculateWorstCaseLoss");
+    }
+
+    /// @dev When costCurrent - maxQ >= costInitial the market maker has locked in profit
+    ///      and worst-case loss must be zero.
+    ///      State: q0=[1e18,1e18] (tiny initial), q=[10000e18,10000e18] (large volume).
+    ///      costCurrent - maxQ ≈ 693e18 >> costInitial ≈ 1.07e18 → loss = 0.
+    function test_calculateWorstCaseLossFromCosts_zero_when_profitable() public view {
+        uint256[] memory qInit = _binary(1e18, 1e18);
+        uint256[] memory qCurr = _binary(10_000e18, 10_000e18);
+
+        uint256 costCurrent = h.costFunction(qCurr, ALPHA_5);
+        uint256 costInitial = h.costFunction(qInit, ALPHA_5);
+
+        uint256 loss = h.calculateWorstCaseLossFromCosts(costCurrent, costInitial, qCurr);
+
+        assertEq(loss, 0, "market maker in profit: worst-case loss must be zero");
+    }
+
+    /// @dev Exercises the branch where costCurrent < maxQ (synthetic pre-computed costs).
+    ///      calculateWorstCaseLossFromCosts accepts raw values; the cost-floor in
+    ///      costFunction() is a separate concern.
+    ///      Formula: worstCaseLoss = costInitial + maxQ - costCurrent
+    ///      Setup: costCurrent=50, costInitial=20, q=[100,30] → maxQ=100
+    ///      Expected: 20 + 100 - 50 = 70  (all values in 1e18 units)
+    function test_calculateWorstCaseLossFromCosts_branch_cost_below_maxQ() public view {
+        uint256 costCurrent = 50e18;
+        uint256 costInitial = 20e18;
+        uint256[] memory q  = _binary(100e18, 30e18); // maxQ = 100e18
+
+        uint256 loss = h.calculateWorstCaseLossFromCosts(costCurrent, costInitial, q);
+
+        assertEq(loss, 70e18, "loss must equal costInitial + maxQ - costCurrent");
+    }
+
+    /// @dev maxQ must be the actual maximum across all elements.
+    ///      Setup: costCurrent=210, costInitial=30, q=[50,200,80]
+    ///      maxQ=200 → surplus=10 → loss = 30-10 = 20  (all in 1e18 units)
+    function test_calculateWorstCaseLossFromCosts_correct_maxQ_selection() public view {
+        uint256 costCurrent = 210e18;
+        uint256 costInitial = 30e18;
+
+        uint256[] memory q = new uint256[](3);
+        q[0] = 50e18;
+        q[1] = 200e18; // maximum
+        q[2] = 80e18;
+
+        uint256 loss = h.calculateWorstCaseLossFromCosts(costCurrent, costInitial, q);
+
+        // surplus = 210 - 200 = 10; loss = 30 - 10 = 20
+        assertEq(loss, 20e18, "loss must use correct maxQ from multi-element array");
+    }
+
+    /// @dev Empty quantities array must revert
+    function test_calculateWorstCaseLossFromCosts_reverts_empty_quantities() public {
+        uint256[] memory empty = new uint256[](0);
+
+        vm.expectRevert(LSMath.EmptyQuantities.selector);
+        h.calculateWorstCaseLossFromCosts(100e18, 50e18, empty);
+    }
+
+    /// @dev End-to-end workflow: calculateTradeCostDetailed feeds directly into
+    ///      calculateWorstCaseLossFromCosts and must match calculateWorstCaseLoss.
+    ///      This mirrors the intended production call pattern in the LP vault.
+    function test_calculateWorstCaseLossFromCosts_integration_with_tradeCostDetailed() public view {
+        uint256[] memory qInit = _binary(10e18, 10e18);
+        uint256[] memory qCurr = _binary(80e18, 40e18);
+
+        // Production pattern: one call to get tradeCost + costTo, reuse costTo
+        (, uint256 costTo) = h.calculateTradeCostDetailed(qInit, qCurr, ALPHA_5);
+        uint256 costInitial  = h.costFunction(qInit, ALPHA_5);
+
+        uint256 lossFromWorkflow = h.calculateWorstCaseLossFromCosts(costTo, costInitial, qCurr);
+        uint256 lossFromVectors  = h.calculateWorstCaseLoss(qCurr, qInit, ALPHA_5);
+
+        assertEq(lossFromWorkflow, lossFromVectors, "integrated workflow must match calculateWorstCaseLoss");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+          calculateWorstCaseLossFromCosts() — FUZZ
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev For any valid binary market, calculateWorstCaseLossFromCosts with
+    ///      real cost values must equal calculateWorstCaseLoss.
+    function testFuzz_calculateWorstCaseLossFromCosts_consistent(
+        uint256 q0Init, uint256 q1Init,
+        uint256 q0Curr, uint256 q1Curr,
+        uint256 alpha
+    ) public view {
+        alpha  = bound(alpha,  5e16,  2e17);
+        q0Init = bound(q0Init, 1e15,  1e25);
+        q1Init = bound(q1Init, 1e15,  1e25);
+        q0Curr = bound(q0Curr, 1e15,  1e25);
+        q1Curr = bound(q1Curr, 1e15,  1e25);
+
+        uint256[] memory qInit = _binary(q0Init, q1Init);
+        uint256[] memory qCurr = _binary(q0Curr, q1Curr);
+
+        uint256 costCurrent = h.costFunction(qCurr, alpha);
+        uint256 costInitial = h.costFunction(qInit, alpha);
+
+        uint256 fromCosts   = h.calculateWorstCaseLossFromCosts(costCurrent, costInitial, qCurr);
+        uint256 fromVectors = h.calculateWorstCaseLoss(qCurr, qInit, alpha);
+
+        assertEq(fromCosts, fromVectors, "fuzz: fromCosts must equal calculateWorstCaseLoss");
+    }
 }
