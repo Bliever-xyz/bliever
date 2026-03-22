@@ -418,6 +418,66 @@ library LSMath {
         tradeCost = int256(costTo) - int256(costFrom);
     }
 
+    /// @notice Calculates the cost to move from qFrom to qTo, and also returns C(qTo).
+    /// @dev Identical to calculateTradeCost() but additionally exposes the computed
+    ///      costTo value so the caller can reuse it (e.g. for calculateWorstCaseLossFromCosts)
+    ///      without a second costFunction() call.  On a 10-outcome market this eliminates
+    ///      one full exp/ln loop (~40,000–60,000 gas) versus calling calculateTradeCost()
+    ///      and calculateWorstCaseLoss() separately.
+    ///
+    /// @param quantitiesFrom  Initial quantity vector q_old
+    /// @param quantitiesTo    Final quantity vector q_new
+    /// @param alpha           Commission parameter in 18-decimal fixed point
+    /// @return tradeCost      C(qTo) − C(qFrom); positive = trader pays, negative = refund
+    /// @return costTo         C(qTo) — ready for reuse in calculateWorstCaseLossFromCosts
+    function calculateTradeCostDetailed(
+        uint256[] memory quantitiesFrom,
+        uint256[] memory quantitiesTo,
+        uint256 alpha
+    ) internal pure returns (int256 tradeCost, uint256 costTo) {
+        if (quantitiesFrom.length != quantitiesTo.length) revert InvalidOutcomeIndex();
+
+        uint256 costFrom = costFunction(quantitiesFrom, alpha);
+        costTo           = costFunction(quantitiesTo,   alpha);
+
+        if (costTo   > uint256(type(int256).max)) revert ArithmeticOverflow();
+        if (costFrom > uint256(type(int256).max)) revert ArithmeticOverflow();
+
+        tradeCost = int256(costTo) - int256(costFrom);
+    }
+
+    /// @notice Calculates worst-case loss given pre-computed cost values.
+    /// @dev Drop-in replacement for calculateWorstCaseLoss() when C(q) and C(q⁰) are
+    ///      already known.  Skips both costFunction() calls and performs only an O(n)
+    ///      scan of `quantities` to find max(qᵢ).
+    ///
+    ///      Loss formula (Prop. 4.9):  C(q⁰) − C(q) + max(qᵢ)
+    ///
+    /// @param costCurrent   Pre-computed C(q)   — current cost function value (18-dec)
+    /// @param costInitial   Pre-computed C(q⁰)  — constant per-market initial cost (18-dec)
+    /// @param quantities    Current quantity vector (scanned for max(qᵢ) only)
+    /// @return worstCaseLoss Maximum possible loss (18-dec)
+    function calculateWorstCaseLossFromCosts(
+        uint256 costCurrent,
+        uint256 costInitial,
+        uint256[] memory quantities
+    ) internal pure returns (uint256 worstCaseLoss) {
+        if (quantities.length == 0) revert EmptyQuantities();
+
+        uint256 maxQ = quantities[0];
+        for (uint256 i = 1; i < quantities.length; ) {
+            if (quantities[i] > maxQ) maxQ = quantities[i];
+            unchecked { ++i; }
+        }
+
+        if (costCurrent < maxQ) {
+            worstCaseLoss = costInitial + maxQ - costCurrent;
+        } else {
+            uint256 surplus = costCurrent - maxQ;
+            worstCaseLoss = (costInitial > surplus) ? costInitial - surplus : 0;
+        }
+    }
+
     /// @notice Calculates the sum of all prices
     /// @dev Useful for validating market state and understanding fee structure.
     ///
