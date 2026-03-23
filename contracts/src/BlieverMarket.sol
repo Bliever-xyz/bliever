@@ -139,8 +139,6 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     error InsufficientMarketQuantity();
     /// @notice C(qNew) < C(qOld) on a buy — should never happen; indicates LSMath bug
     error NegativeBuyCost();
-    /// @notice Payout is too small to express in USDC (< 1 USDC-wei = 1 unit of 6-dec)
-    error PayoutBelowMinimum();
     /// @notice share amount is below MIN_SHARE_AMOUNT (dust-trade guard)
     error ShareAmountTooSmall(uint256 amount, uint256 minimum);
     /// @notice Permit signature was consumed (front-run) and existing allowance is insufficient
@@ -220,7 +218,24 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     );
 
     /// @notice Emitted when the factory expires an unresolved market past its deadline.
-    event MarketExpired(address indexed factory, uint40 timestamp);
+    /// @param reason  Classification of why the market was expired — aids off-chain indexing
+    ///                and post-mortem analytics without requiring callers to infer cause from
+    ///                context.  Currently always TIMEOUT; reserved for future oracle-error paths.
+    event MarketExpired(address indexed factory, uint40 timestamp, ExpiryReason reason);
+
+    /// @notice Emitted when a winner's share balance rounds to zero USDC (dust position).
+    ///         The caller's `_claimed` flag is set to `true`; no USDC is transferred and
+    ///         the pool's `claimWinnings` is never called.  The dust share value is already
+    ///         excluded from `settledPayout` (floor division in `resolve()`) and is silently
+    ///         absorbed into LP NAV as part of the market-making cost — no funds are locked.
+    /// @param winner          Address whose dust claim was processed
+    /// @param winningOutcome  Winning outcome index
+    /// @param shareAmount     Dust balance (18-dec); convertible USDC value = 0
+    event DustForfeited(
+        address indexed winner,
+        uint8   indexed winningOutcome,
+        uint256         shareAmount
+    );
 
     /*//////////////////////////////////////////////////////////////
                      STORAGE — CAREFULLY LAID OUT FOR CLONES
@@ -829,7 +844,18 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         if (shares18 == 0)         revert NoWinningShares();
 
         uint256 payoutUsdc = _floorToUsdc(shares18);
-        if (payoutUsdc == 0)       revert PayoutBelowMinimum(); // shares < 1 USDC-wei
+
+        // ── Dust path: shares18 < SHARE_TO_USDC (< 1 USDC-wei) ──────────────
+        // Floor conversion yields zero.  Rather than reverting, mark as claimed
+        // (prevents repeated failed attempts), emit DustForfeited, and return without
+        // touching the pool.  The dust value is already excluded from pool.settledPayout
+        // via the identical floor division in resolve() — no funds are locked, and
+        // pool.claimWinnings is deliberately NOT called (amount = 0 would revert there).
+        if (payoutUsdc == 0) {
+            _claimed[caller] = true;
+            emit DustForfeited(caller, wo, shares18);
+            return;
+        }
 
         // ── Effects (before interaction — CEI) ───────────────────────────────
         _claimed[caller] = true;
@@ -875,7 +901,7 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         // ── Interaction: Settle with zero payout ─────────────────────────────
         IBlieverV1Pool(pool).settleMarket(0);
 
-        emit MarketExpired(factory, uint40(block.timestamp));
+        emit MarketExpired(factory, uint40(block.timestamp), ExpiryReason.TIMEOUT);
     }
 
     /*//////////////////////////////////////////////////////////////
