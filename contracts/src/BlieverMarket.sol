@@ -147,6 +147,16 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     error InsufficientPermitAllowance();
 
     /*//////////////////////////////////////////////////////////////
+                          TYPE DECLARATIONS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Reason an unresolved market was expired by the factory via expireUnresolved().
+    ///         TIMEOUT: resolutionDeadline passed with no oracle resolution.
+    ///         Reserved for future oracle-failure variants (e.g. ORACLE_ERROR) without
+    ///         ABI breakage — callers must handle unknown enum values gracefully.
+    enum ExpiryReason { TIMEOUT }
+
+    /*//////////////////////////////////////////////////////////////
                                EVENTS
     //////////////////////////////////////////////////////////////*/
 
