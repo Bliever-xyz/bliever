@@ -1229,6 +1229,56 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         }
     }
 
+    /// @dev Load the current quantity vector and simultaneously produce q_new for a sell,
+    ///      applying the CSS translation in a single loop.  Replaces the three-step pattern
+    ///      of _loadQuantities(n) + _copyArray(qOld, n) + CSS mutation loop:
+    ///        • Three separate memory traversals → one combined pass.
+    ///        • The InsufficientMarketQuantity guard is applied inline at idx.
+    ///
+    ///      CSS q-vector delta derivation (Othman et al. §3.3.2):
+    ///        actual_delta[idx]  = −shareAmount + tBar = −netReduce
+    ///        actual_delta[j≠idx] = +tBar
+    ///      Therefore:
+    ///        qNew[idx]  = qOld[idx] − netReduce          ← NOT − netReduce + tBar
+    ///        qNew[j≠idx] = qOld[j]  + tBar
+    ///
+    ///      When tBar = 0 (standard sell, no CSS), both branches simplify to:
+    ///        qNew[idx]  = qOld[idx] − shareAmount
+    ///        qNew[j≠idx] = qOld[j]  (unchanged)
+    ///
+    /// @param n          Number of outcomes (= outcomeCount, cached by caller)
+    /// @param idx        The outcome index being sold
+    /// @param netReduce  Net decrease to q[idx] (= shareAmount − tBar = actual_delta[idx] negated)
+    /// @param tBar       CSS translation scalar applied to all OTHER outcomes (0 for standard sell)
+    /// @return qOld  Current quantity vector snapshot (all n slots, unmodified)
+    /// @return qNew  New quantity vector after the CSS-adjusted sell (one combined pass)
+    function _loadQuantitiesForSell(uint256 n, uint256 idx, uint256 netReduce, uint256 tBar)
+        internal
+        view
+        returns (uint256[] memory qOld, uint256[] memory qNew)
+    {
+        qOld = new uint256[](n);
+        qNew = new uint256[](n);
+        for (uint256 i = 0; i < n;) {
+            uint256 q = _quantities[i];
+            qOld[i] = q;
+            if (i == idx) {
+                // actual_delta[idx] = −netReduce.  tBar is NOT added to the sold outcome:
+                // the paper's translation vector adds tBar to ALL outcomes in the trader's
+                // holdings, but for the sold outcome the net effect is already encoded in
+                // netReduce (= shareAmount − tBar).  Adding tBar again would inflate q[idx]
+                // by tBar units beyond the correct LS-LMSR market state.
+                // Safe: netReduce ≤ traderBal ≤ _totalTraderShares[idx] ≤ q[idx] (invariant).
+                if (netReduce > 0 && q < netReduce) revert InsufficientMarketQuantity();
+                unchecked { qNew[i] = q - netReduce; }
+            } else {
+                // actual_delta[j≠idx] = +tBar.
+                qNew[i] = q + tBar;
+            }
+            unchecked { ++i; }
+        }
+    }
+
     /// @dev Convert 18-dec amount to 6-dec USDC, rounding DOWN (floor).
     ///      Used for refund and liability computations (vault-protective).
     function _floorToUsdc(uint256 amount18) internal pure returns (uint256) {
