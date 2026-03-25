@@ -604,20 +604,40 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     ///         Cost sign convention:
     ///           - Negative tradeCost18 → vault REFUNDS the trader (typical sell).
     ///           - Positive tradeCost18 → trader PAYS the vault (unusual; large t_bar).
-    ///         In either case, `minRefundUsdc` guards against unfavourable slippage.
+    ///         `minRefundUsdc` guards against unfavourable slippage on the refund side;
+    ///         `maxCostUsdc` guards against unexpected CSS cost on the payment side.
     ///
-    ///         ⚠️  APPROVAL NOTE: If the CSS translation results in a net PAYMENT
-    ///             (rare), the trader must also have approved the vault for USDC.
-    ///             For a standard sell (refund), no approval is required.
+    ///         ── Permit (optional, CSS cost path only) ──────────────────────────
+    ///         Pass `v != 0` to attempt an EIP-2612 permit ONLY when a net payment
+    ///         is detected (isRefund == false).  The permit is never attempted on
+    ///         standard refund sells — saving gas on the overwhelming majority of
+    ///         sell transactions.
+    ///         If the permit signature has already been consumed (e.g. front-run),
+    ///         the call falls back silently to any pre-existing allowance.
+    ///         Pass `v = 0, r = 0, s = 0, deadline = 0` to skip permit entirely and
+    ///         rely on a pre-existing `USDC.approve(pool, amount)` call, or when a
+    ///         refund is expected (no approval required for standard sells).
     ///
     /// @param outcomeIndex    Primary outcome to reduce position in [0, outcomeCount)
-    /// @param shareAmount     Shares to sell from outcomeIndex (18-dec, > 0)
+    /// @param shareAmount     Shares to sell from outcomeIndex (18-dec, ≥ MIN_SHARE_AMOUNT)
     /// @param minRefundUsdc   Minimum USDC refund expected (6-dec).
     ///                        Set to 0 if the caller accepts paying (e.g. large CSS translation).
+    /// @param maxCostUsdc     Maximum USDC the trader will pay if CSS causes a net cost (6-dec).
+    ///                        Acts as both slippage guard and permit amount on the CSS path.
+    ///                        Pass 0 if a refund is expected (standard sell, cost path unreachable).
+    /// @param deadline        EIP-2612 permit deadline (0 = skip permit)
+    /// @param v               EIP-2612 permit signature v (0 = skip permit)
+    /// @param r               EIP-2612 permit signature r
+    /// @param s               EIP-2612 permit signature s
     function sell(
         uint256 outcomeIndex,
         uint256 shareAmount,
-        uint256 minRefundUsdc
+        uint256 minRefundUsdc,
+        uint256 maxCostUsdc,
+        uint256 deadline,
+        uint8   v,
+        bytes32 r,
+        bytes32 s
     ) external nonReentrant whenNotPaused tradingOpen {
         // ── Pre-condition Checks ─────────────────────────────────────────────
         if (shareAmount < MIN_SHARE_AMOUNT)  revert ShareAmountTooSmall(shareAmount, MIN_SHARE_AMOUNT);
@@ -627,45 +647,36 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         uint256 n      = outcomeCount;
         uint256 _alpha = alpha;
 
-        // ── Load Trader's Current Position ───────────────────────────────────
-        // qTrader[i] = shares held by trader for outcome i (18-dec, always ≥ 0)
-        uint256[] memory qTrader = _loadTraderShares(trader, n);
+        // ── Load Only the Required Trader Balance ────────────────────────────
+        // Only _shares[trader][outcomeIndex] is needed to compute tBar and update
+        // the sold-outcome balance.  Loading the full n-slot array via
+        // _loadTraderShares(trader, n) is unnecessary: all other outcome slots are
+        // only incremented by +tBar in the effects step and never read here.
+        // This replaces n mapping SLOADs with 1 in the standard sell (tBar = 0).
+        uint256 traderBal = _shares[trader][outcomeIndex];
 
         // ── CSS Translation ──────────────────────────────────────────────────
         //
-        //   tBar = max(0, shareAmount − qTrader[outcomeIndex])
+        //   tBar = max(0, shareAmount − traderBal)
         //
-        //   If qTrader[outcomeIndex] ≥ shareAmount: tBar = 0 (ordinary sell).
-        //   Otherwise:                              tBar > 0 (translation applied).
+        //   If traderBal ≥ shareAmount: tBar = 0 (ordinary sell).
+        //   Otherwise:                  tBar > 0 (translation applied).
         //
-        uint256 tBar = (qTrader[outcomeIndex] >= shareAmount)
-            ? 0
-            : shareAmount - qTrader[outcomeIndex];
+        uint256 tBar      = (traderBal >= shareAmount) ? 0 : shareAmount - traderBal;
 
         // Net reduction in the sold outcome's market quantity.
-        // = shareAmount − tBar = qTrader[outcomeIndex] (if tBar > 0) or shareAmount.
+        // = shareAmount − tBar = traderBal (if tBar > 0) or shareAmount.
         // Always ≤ qOld[outcomeIndex] — proven by the Internal Ledger invariant:
         //   sum of all traders' shares = market q ≥ any single trader's position.
         uint256 netReduce = shareAmount - tBar;
 
-        // ── Build q_new ──────────────────────────────────────────────────────
-        uint256[] memory qOld = _loadQuantities(n);
-        uint256[] memory qNew = _copyArray(qOld, n);
-
-        // Reduce sold outcome (safe: qOld[outcomeIndex] ≥ netReduce, see proof above).
-        if (netReduce > 0) {
-            if (qOld[outcomeIndex] < netReduce) revert InsufficientMarketQuantity();
-            unchecked { qNew[outcomeIndex] -= netReduce; }
-        }
-
-        // Apply t_bar to all outcomes (including the sold one, which offsets by +tBar).
-        // Net for sold outcome: −netReduce + tBar = −qTrader[outcomeIndex] → result = 0 when tBar>0.
-        if (tBar > 0) {
-            for (uint256 i = 0; i < n;) {
-                qNew[i] += tBar;
-                unchecked { ++i; }
-            }
-        }
+        // ── Build q_old and q_new (single combined loop) ─────────────────────
+        // _loadQuantitiesForSell reads all n quantity slots once and simultaneously
+        // constructs qOld and qNew, applying netReduce and tBar in the same pass.
+        // Replaces the former three-step pattern: _loadQuantities(n) +
+        // _copyArray(qOld, n) + CSS mutation loop (three memory passes → one).
+        (uint256[] memory qOld, uint256[] memory qNew) =
+            _loadQuantitiesForSell(n, outcomeIndex, netReduce, tBar);
 
         // ── Trade Cost Calculation ───────────────────────────────────────────
         // tradeCost18 = C(qNew) − C(qOld).
@@ -678,8 +689,8 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         // ── Compute Updated Vault Liability ──────────────────────────────────
         // Reuses costNew from above; reads _initialCost = C(q⁰) from a single warm SLOAD.
         // Eliminates _loadInitialQuantities() (n SLOADs) and costFunction(q⁰) on every sell.
-        uint256 newLiability18    = LSMath.calculateWorstCaseLossFromCosts(costNew, _initialCost, qNew);
-        uint256 newLiabilityUsdc  = _floorToUsdc(newLiability18);
+        uint256 newLiability18   = LSMath.calculateWorstCaseLossFromCosts(costNew, _initialCost, qNew);
+        uint256 newLiabilityUsdc = _floorToUsdc(newLiability18);
 
         // ── Determine Refund or Payment ──────────────────────────────────────
         bool isRefund = (tradeCost18 < 0);
@@ -692,53 +703,40 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         // Refund: floor conversion (vault keeps more). Payment: ceil (vault collects more).
         uint256 absAmountUsdc = isRefund ? _floorToUsdc(absAmount18) : _ceilToUsdc(absAmount18);
 
-        // ── Slippage Guard (on the refund) ───────────────────────────────────
-        // Guard applies when trader expects a refund. If they accepted paying, minRefundUsdc = 0.
+        // ── Slippage Guards ──────────────────────────────────────────────────
+        // Refund guard: revert if the refund is below the trader's minimum.
         if (isRefund && absAmountUsdc < minRefundUsdc) {
             revert SlippageExceeded(absAmountUsdc, minRefundUsdc);
+        }
+        // Cost guard: revert if the net CSS payment exceeds the trader's cap.
+        if (!isRefund && absAmountUsdc > maxCostUsdc) {
+            revert SlippageExceeded(absAmountUsdc, maxCostUsdc);
         }
 
         // ── Effects: Update AMM & Internal Ledger (CEI) ─────────────────────
         _storeQuantities(qNew, n);
 
-        // Update trader's per-outcome position using actual_delta:
-        //   actual_delta[outcomeIndex] = −netReduce + tBar (net: reduces by netReduce, then +tBar)
-        //   actual_delta[i ≠ outcomeIndex] = +tBar
+        // CSS actual_delta proof (Othman et al. §3.3.2):
+        //   actual_delta[outcomeIndex] = −shareAmount + tBar = −netReduce
+        //   actual_delta[j ≠ outcomeIndex] = +tBar
         //
-        // For the sold outcome (combined in one step):
-        uint256 oldTraderBal = qTrader[outcomeIndex];
-        // new = oldTraderBal − netReduce + tBar
-        // Case no-translation: new = oldTraderBal − netReduce = oldTraderBal − shareAmount ≥ 0
-        // Case translation:    new = oldTraderBal − oldTraderBal + tBar... wait:
-        //   netReduce = shareAmount − tBar, so:
-        //   new = oldTraderBal − (shareAmount − tBar) + tBar = oldTraderBal − shareAmount + 2·tBar
-        //   BUT: with translation, tBar = shareAmount − oldTraderBal, so:
-        //   new = oldTraderBal − shareAmount + 2(shareAmount − oldTraderBal) = shareAmount − oldTraderBal ??? 
-        //
-        // WAIT. Let me re-derive more carefully.
-        // actual_delta[outcomeIndex] = desired_delta + tBar = −shareAmount + tBar
-        // new = oldTraderBal + (−shareAmount + tBar)
-        //     = oldTraderBal − shareAmount + tBar
-        // Case no-trans (tBar=0): new = oldTraderBal − shareAmount ≥ 0 ✓
-        // Case trans (tBar = shareAmount − oldTraderBal):
-        //     new = oldTraderBal − shareAmount + (shareAmount − oldTraderBal) = 0 ✓
-        //
-        // So: new position = oldTraderBal − shareAmount + tBar
-        // Since oldTraderBal ≥ shareAmount − tBar (equivalent to oldTraderBal + tBar ≥ shareAmount),
-        // and tBar = max(0, shareAmount − oldTraderBal), we have oldTraderBal + tBar ≥ shareAmount. ✓
+        // Update sold outcome's trader balance (= old + actual_delta[i]):
+        //   new = traderBal + (−shareAmount + tBar) = traderBal − netReduce
+        //   Case tBar = 0 (traderBal ≥ shareAmount): new = traderBal − shareAmount ≥ 0 ✓
+        //   Case tBar > 0 (tBar = shareAmount − traderBal): new = 0 ✓ (sold everything)
+        //   Underflow impossible by invariant; unchecked saves gas.
+        unchecked {
+            _shares[trader][outcomeIndex]    = traderBal + tBar - shareAmount;
+            // _totalTraderShares[outcomeIndex] ≥ traderBal ≥ shareAmount − tBar, so safe.
+            _totalTraderShares[outcomeIndex] = _totalTraderShares[outcomeIndex] + tBar - shareAmount;
+        }
 
-        uint256 newTraderBalForSold = oldTraderBal + tBar - shareAmount;
-        _shares[trader][outcomeIndex] = newTraderBalForSold;
-
-        // Update _totalTraderShares for the sold outcome:
-        _totalTraderShares[outcomeIndex] = _totalTraderShares[outcomeIndex] + tBar - shareAmount;
-
-        // For all other outcomes, apply +tBar (CSS translation buy):
+        // For all other outcomes, apply actual_delta[j≠i] = +tBar:
         if (tBar > 0) {
             for (uint256 i = 0; i < n;) {
                 if (i != outcomeIndex) {
-                    _shares[trader][i]         += tBar;
-                    _totalTraderShares[i]      += tBar;
+                    _shares[trader][i]    += tBar;
+                    _totalTraderShares[i] += tBar;
                 }
                 unchecked { ++i; }
             }
@@ -746,10 +744,22 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
 
         // ── Interactions: Route USDC Movement to Vault ───────────────────────
         if (isRefund) {
-            // Vault pushes refund to trader.
+            // Standard sell: vault pushes refund to trader. No permit needed.
             IBlieverV1Pool(pool).distributeRefund(trader, absAmountUsdc, newLiabilityUsdc);
         } else {
-            // Trader pays vault (CSS inflated the cost; trader must have approved vault).
+            // Net-cost sell (CSS): trader pays vault.
+            // Attempt permit ONLY when a signature is supplied (v != 0) — saves gas
+            // on the 95%+ of sells that are standard refunds and never reach this branch.
+            // Uses the `usdc` slot cached at initialization — no external call to pool.
+            // Falls back silently to any pre-existing allowance if nonce was consumed.
+            if (v != 0) {
+                try IERC20Permit(usdc).permit(
+                    trader, pool, maxCostUsdc, deadline, v, r, s
+                ) {} catch {
+                    if (IERC20(usdc).allowance(trader, pool) < absAmountUsdc)
+                        revert InsufficientPermitAllowance();
+                }
+            }
             IBlieverV1Pool(pool).collectTradeCost(trader, absAmountUsdc, newLiabilityUsdc);
         }
 
@@ -1003,8 +1013,13 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
             if (qOld[outcomeIndex] < netReduce) return (0, 0); // defensive
             unchecked { qNew[outcomeIndex] -= netReduce; }
         }
+        // actual_delta[j≠outcomeIndex] = +tBar; actual_delta[outcomeIndex] = −netReduce (already applied above).
+        // tBar is NOT added to the sold outcome: netReduce already encodes the full CSS delta for that slot.
         if (tBar > 0) {
-            for (uint256 i = 0; i < n;) { qNew[i] += tBar; unchecked { ++i; } }
+            for (uint256 i = 0; i < n;) {
+                if (i != outcomeIndex) { qNew[i] += tBar; }
+                unchecked { ++i; }
+            }
         }
 
         int256 tradeCost18 = LSMath.calculateTradeCost(qOld, qNew, alpha);
