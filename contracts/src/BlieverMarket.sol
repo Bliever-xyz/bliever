@@ -903,6 +903,7 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
 
         // ── Effects ─────────────────────────────────────────────────────────
         resolved       = true;
+        winningOutcome = outcomeCount;
         // winningOutcome remains 0 (default) — no legitimate claim is possible
         // since resolved=true with totalTraderShares[any] is still valid, but
         // pool.settleMarket(0) means claimWinnings will always revert (amount=0 or
