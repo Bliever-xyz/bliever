@@ -38,10 +38,14 @@ optimizer_runs   = 200
 # Particularly useful for LSMath's Taylor series and bit-manipulation in ln().
 via_ir = true
 
+# ── Gas reporting ─────────────────────────────────────────────────────────────
+# Snapshot file written by `forge snapshot`
+gas_snapshot_file = "gas_snapshot/.gas-snapshot"
+
 # ── EVM target ──────────────────────────────────────────────
 # Base is EVM-compatible (same opcodes as Ethereum mainnet post-merge).
 # "paris" is a safe, widely-supported EVM version.
-evm_version = "paris"
+evm_version = "cancun"
 
 # ── Fuzz testing ─────────────────────────────────────────────
 # LSMath is a math library — fuzz testing is critical.
