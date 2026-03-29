@@ -294,7 +294,7 @@ contract BlieverMarket_FuzzTest is BlieverMarketBase {
         uint256 total1     = market2.getTotalTraderShares(1);
 
         // q[0] = epsilon + totalTraderShares[0] (alice bought outcome 0)
-        assertEq(q[0], EPSILON_2 + total0, "q[0] = ε + totalTraderShares[0]");
+        assertEq(q[0], EPSILON_2 + total0, unicode"q[0] = ε + totalTraderShares[0]");
         // q[1] unchanged: epsilon + 0
         assertEq(q[1], EPSILON_2 + total1, "q[1] = ε + totalTraderShares[1]");
     }
