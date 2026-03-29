@@ -296,7 +296,7 @@ contract BlieverMarket_FuzzTest is BlieverMarketBase {
         // q[0] = epsilon + totalTraderShares[0] (alice bought outcome 0)
         assertEq(q[0], EPSILON_2 + total0, unicode"q[0] = ε + totalTraderShares[0]");
         // q[1] unchanged: epsilon + 0
-        assertEq(q[1], EPSILON_2 + total1, "q[1] = ε + totalTraderShares[1]");
+        assertEq(q[1], EPSILON_2 + total1, unicode"q[1] = ε + totalTraderShares[1]");
     }
 
     /// @dev After resolve, totalPayoutUsdc matches what settleMarket received.
