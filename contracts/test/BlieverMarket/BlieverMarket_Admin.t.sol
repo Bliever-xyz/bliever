@@ -205,7 +205,7 @@ contract BlieverMarket_AdminTest is BlieverMarketBase {
         // At symmetric init with full CSS translation, result depends on AMM state.
         // Assert they're not both nonzero (only one of refund/cost can be > 0).
         assertTrue(refund == 0 || cost == 0, "at most one of refund/cost is non-zero");
-        console2.log("CSS sell estimate — refund:", refund, "cost:", cost);
+        console2.log("CSS sell estimate - refund:", refund, "cost:", cost);
     }
 
     /*//////////////////////////////////////////////////////////////
