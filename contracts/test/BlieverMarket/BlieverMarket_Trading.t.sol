@@ -437,7 +437,7 @@ contract BlieverMarket_TradingTest is BlieverMarketBase {
 
     function test_sell_revert_minRefundSlippage() public {
         _buy(market2, alice, 0, SHARE_1);
-        uint256 actualRefund = market2.getSellEstimate(alice, 0, SHARE_1).refundUsdc;
+        (uint256 actualRefund, ) = market2.getSellEstimate(alice, 0, SHARE_1);
 
         // Demand more refund than the AMM will return → SlippageExceeded
         vm.prank(alice);
@@ -489,7 +489,7 @@ contract BlieverMarket_TradingTest is BlieverMarketBase {
         market2.sell(0, SHARE_1, 0, MAX_COST, 0, 0, bytes32(0), bytes32(0));
 
         // Actual refund sent to alice via pool must match estimate ± 1 (floor rounding)
-        assertApproxEqAbs(pool.lastRefund(), estRefund, 1, "actual refund ≈ estimate");
+        assertApproxEqAbs(pool.lastRefund(), estRefund, 1, unicode"actual refund ≈ estimate");
     }
 
     /// @dev getSellEstimate() returns (0, 0) for zero shareAmount.
