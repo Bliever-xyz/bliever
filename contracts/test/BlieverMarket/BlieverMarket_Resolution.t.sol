@@ -305,7 +305,7 @@ contract BlieverMarket_ResolutionTest is BlieverMarketBase {
 
         assertTrue(market2.resolved(),            "resolved flag set");
         assertEq(pool.settleCalls(),  1,           "settleMarket called");
-        assertEq(pool.lastSettledPayout(), 0,      "settleMarket(0) — zero payout");
+        assertEq(pool.lastSettledPayout(), 0, "settleMarket(0) - zero payout");
     }
 
     /// @dev After expiry, winningOutcome = outcomeCount (out of range) so no one can claim.
