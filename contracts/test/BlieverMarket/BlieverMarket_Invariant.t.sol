@@ -164,7 +164,7 @@ contract BlieverMarket_InvariantTest is StdInvariant, BlieverMarketBase {
         uint256 total0 = market2.getTotalTraderShares(0);
         // q[0] = ε + (net trader shares for outcome 0)
         // Note: CSS buys to outcome 1 can push total1 > 0 if CSS triggers, but handler only does standard sells
-        assertEq(q[0], EPSILON_2 + total0, "I-2: q[0] = ε + totalTraderShares[0]");
+        assertEq(q[0], EPSILON_2 + total0, unicode"I-2: q[0] = ε + totalTraderShares[0]");
     }
 
     /// @dev I-3: sum of individual balances == getTotalTraderShares() for outcome 0.
@@ -173,7 +173,7 @@ contract BlieverMarket_InvariantTest is StdInvariant, BlieverMarketBase {
                          + market2.getShares(bob,   0)
                          + market2.getShares(carol, 0);
         assertEq(market2.getTotalTraderShares(0), expected,
-            "I-3: totalTraderShares[0] == Σ individual balances");
+            unicode"I-3: totalTraderShares[0] == Σ individual balances");
     }
 
     /// @dev I-4: Sum of all prices > 1e18 (LS-LMSR invariant — spread is always positive).
