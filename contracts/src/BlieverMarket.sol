@@ -256,10 +256,13 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     // ── Packed Slot B ── (20 + 5 + 5 = 30 bytes, 2 bytes free)
     /// @notice Resolution Adapter address.  Only address that may call resolve().
     address public resolver;          // 20 bytes
-    /// @notice Unix timestamp (seconds): last moment buy / sell is accepted.
+    /// @notice Unix timestamp (seconds): first second at which buy / sell is no longer accepted.
+    ///         Trading is permitted while block.timestamp < tradingDeadline; the deadline second
+    ///         itself is closed (TradingClosed reverts at block.timestamp >= tradingDeadline).
     uint40  public tradingDeadline;   // 5 bytes
-    /// @notice Unix timestamp (seconds): deadline for resolver to call resolve().
-    ///         After this passes without resolution, the factory may call expireUnresolved().
+    /// @notice Unix timestamp (seconds): first second at which resolve() is no longer accepted.
+    ///         The resolver must call resolve() before this timestamp.
+    ///         After this second passes without resolution, the factory may call expireUnresolved().
     uint40  public resolutionDeadline; // 5 bytes
 
     // ── Slot C ── (20 bytes, 12 free — factory address, padded)
@@ -385,8 +388,8 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     /// @param _questionId         UMA oracle question ID, bound at market creation
     /// @param _nOutcomes          Number of mutually exclusive outcomes [2, 100]
     /// @param _alpha              LS-LMSR α from pool at registration time (18-dec)
-    /// @param _tradingDeadline    Unix timestamp: trading closes after this second
-    /// @param _resolutionDeadline Unix timestamp: resolver must call resolve() by this second
+    /// @param _tradingDeadline    Unix timestamp: trading closes at this second (inclusive — block.timestamp >= tradingDeadline reverts)
+    /// @param _resolutionDeadline Unix timestamp: resolution closes at this second; resolver must call resolve() before this timestamp
     /// @param _epsilon            Per-outcome seed quantity (18-dec).
     ///                            Satisfies: C([ε,...,ε]) / SHARE_TO_USDC ≈ maxRiskPerMarket
     /// @param _resolver           Resolution Adapter address (sole right to call resolve())
@@ -803,7 +806,7 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     function resolve(uint8 _winningOutcome) external onlyResolver {
         // ── Checks ──────────────────────────────────────────────────────────
         if (resolved)                            revert MarketAlreadyResolved();
-        if (block.timestamp > resolutionDeadline) revert ResolutionDeadlinePassed();
+        if (block.timestamp >= resolutionDeadline) revert ResolutionDeadlinePassed();
         if (_winningOutcome >= outcomeCount)
             revert InvalidOutcomeIndex(_winningOutcome, outcomeCount);
 
@@ -958,6 +961,8 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
 
     /// @notice Estimate USDC cost (6-dec) for buying `shareAmount` of `outcomeIndex`.
     ///         View-only — does not modify state.  Use for UI quote computation.
+    ///         Uses _loadQuantitiesForBuy to build qOld and qNew in a single storage pass,
+    ///         consistent with the buy() write path.
     /// @param outcomeIndex  Outcome to buy [0, outcomeCount)
     /// @param shareAmount   Number of shares to simulate (18-dec)
     /// @return costUsdc  Estimated USDC cost (6-dec, ceiling rounded)
@@ -969,10 +974,9 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
             revert InvalidOutcomeIndex(outcomeIndex, outcomeCount);
         if (shareAmount == 0) return 0;
 
-        uint256 n             = outcomeCount;
-        uint256[] memory qOld = _loadQuantities(n);
-        uint256[] memory qNew = _copyArray(qOld, n);
-        qNew[outcomeIndex]   += shareAmount;
+        uint256 n = outcomeCount;
+        (uint256[] memory qOld, uint256[] memory qNew) =
+            _loadQuantitiesForBuy(n, outcomeIndex, shareAmount);
 
         int256 cost18 = LSMath.calculateTradeCost(qOld, qNew, alpha);
         if (cost18 < 0) return 0; // should not happen for a pure buy
@@ -1125,7 +1129,7 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     ) {
         _resolved            = resolved;
         _winningOutcome      = winningOutcome;
-        _tradingOpen         = !resolved && block.timestamp <= tradingDeadline;
+        _tradingOpen         = !resolved && block.timestamp < tradingDeadline;
         _tradingDeadline_    = tradingDeadline;
         _resolutionDeadline_ = resolutionDeadline;
 
@@ -1148,8 +1152,10 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     ///      Extracting to an internal function means the compiler emits this
     ///      bytecode once; each modifier call-site jumps here instead of
     ///      receiving an inlined copy, reducing overall contract code size.
+    ///      Trading is permitted while block.timestamp < tradingDeadline.
+    ///      At block.timestamp == tradingDeadline the condition fires (>=) and trading is closed.
     function _tradingOpen() internal view {
-        if (resolved || block.timestamp > tradingDeadline) revert TradingClosed();
+        if (resolved || block.timestamp >= tradingDeadline) revert TradingClosed();
     }
 
     /// @dev Extracted body of the `onlyResolver` modifier.
