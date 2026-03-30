@@ -181,7 +181,7 @@ contract BlieverMarket_TradingTest is BlieverMarketBase {
     function test_buy_revert_slippageExceeded() public {
         _setupTrader(alice, TRADER_USDC);
         vm.prank(alice);
-        vm.expectRevert(); // SlippageExceeded — maxCostUsdc = 0, actual cost > 0
+        vm.expectRevert(BlieverMarket.SlippageExceeded.selector);
         market2.buy(0, SHARE_1, 0, 0, 0, bytes32(0), bytes32(0));
     }
 
@@ -441,7 +441,7 @@ contract BlieverMarket_TradingTest is BlieverMarketBase {
 
         // Demand more refund than the AMM will return → SlippageExceeded
         vm.prank(alice);
-        vm.expectRevert(); // SlippageExceeded
+        vm.expectRevert(BlieverMarket.SlippageExceeded.selector);
         market2.sell(0, SHARE_1, actualRefund + 1e6, MAX_COST, 0, 0, bytes32(0), bytes32(0));
     }
 
@@ -503,5 +503,85 @@ contract BlieverMarket_TradingTest is BlieverMarketBase {
     function test_getBuyCost_zeroAmount_returnsZero() public view {
         uint256 cost = market2.getBuyCost(0, 0);
         assertEq(cost, 0);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                     BUY — EIP-2612 PERMIT PATH
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Happy path: aliceP has zero allowance but supplies a valid permit
+    ///      signature with v != 0.  The permit is consumed inside buy() and
+    ///      the trade completes end-to-end.
+    function test_buy_withPermit_happyPath() public {
+        // Give aliceP tokens but NO approval — permit will supply it
+        permitUsdc.mint(aliceP, TRADER_USDC);
+
+        uint256 cost = market2p.getBuyCost(0, SHARE_1);
+        uint256 cap  = cost * 2;
+        uint256 deadline = block.timestamp + 1 hours;
+
+        (uint8 v, bytes32 r, bytes32 s) =
+            _permitSignature(aliceP, ALICE_PK, address(permitPool), cap, deadline);
+
+        vm.prank(aliceP);
+        market2p.buy(0, SHARE_1, cap, deadline, v, r, s);
+
+        assertEq(market2p.getShares(aliceP, 0), SHARE_1, "shares credited via permit buy");
+        // Nonce was consumed
+        assertEq(permitUsdc.nonces(aliceP), 1, "permit nonce incremented");
+    }
+
+    /// @dev Front-run path: an attacker pre-consumes aliceP's permit nonce before her
+    ///      buy arrives.  The try-block in buy() fails, the catch block falls back to
+    ///      allowance — but aliceP has zero allowance, so InsufficientPermitAllowance
+    ///      is the expected revert.
+    function test_buy_permit_frontrun_revertsInsufficientPermitAllowance() public {
+        permitUsdc.mint(aliceP, TRADER_USDC);
+
+        uint256 cost = market2p.getBuyCost(0, SHARE_1);
+        uint256 cap  = cost * 2;
+        uint256 deadline = block.timestamp + 1 hours;
+
+        (uint8 v, bytes32 r, bytes32 s) =
+            _permitSignature(aliceP, ALICE_PK, address(permitPool), cap, deadline);
+
+        // Attacker front-runs and consumes the nonce
+        vm.prank(attacker);
+        permitUsdc.permit(aliceP, address(permitPool), cap, deadline, v, r, s);
+
+        // aliceP's nonce is now stale — and she has zero allowance
+        assertEq(permitUsdc.allowance(aliceP, address(permitPool)), 0, "allowance is zero after front-run");
+
+        vm.prank(aliceP);
+        vm.expectRevert(BlieverMarket.InsufficientPermitAllowance.selector);
+        market2p.buy(0, SHARE_1, cap, deadline, v, r, s);
+    }
+
+    /// @dev Front-run path with pre-existing allowance: attacker consumes nonce but
+    ///      aliceP already has sufficient allowance.  The catch block silently falls back
+    ///      and the buy succeeds without reverting.
+    function test_buy_permit_frontrun_fallsBackToAllowance_succeeds() public {
+        permitUsdc.mint(aliceP, TRADER_USDC);
+
+        uint256 cost = market2p.getBuyCost(0, SHARE_1);
+        uint256 cap  = cost * 2;
+        uint256 deadline = block.timestamp + 1 hours;
+
+        (uint8 v, bytes32 r, bytes32 s) =
+            _permitSignature(aliceP, ALICE_PK, address(permitPool), cap, deadline);
+
+        // Attacker front-runs the permit
+        vm.prank(attacker);
+        permitUsdc.permit(aliceP, address(permitPool), cap, deadline, v, r, s);
+
+        // But aliceP has a pre-existing approval that satisfies the trade
+        vm.prank(aliceP);
+        permitUsdc.approve(address(permitPool), type(uint256).max);
+
+        // Buy must succeed despite the consumed nonce — fallback allowance is sufficient
+        vm.prank(aliceP);
+        market2p.buy(0, SHARE_1, cap, deadline, v, r, s);
+
+        assertEq(market2p.getShares(aliceP, 0), SHARE_1, "buy succeeds via allowance fallback");
     }
 }
