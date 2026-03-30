@@ -178,7 +178,7 @@ contract BlieverMarket_FuzzTest is BlieverMarketBase {
         _setupTrader(alice, TRADER_USDC * 100);
 
         vm.prank(alice);
-        vm.expectRevert(); // SlippageExceeded — actual cost > 0, cap = 0
+        vm.expectRevert(BlieverMarket.SlippageExceeded.selector);
         market2.buy(0, shareAmt, 0, 0, 0, bytes32(0), bytes32(0));
     }
 
