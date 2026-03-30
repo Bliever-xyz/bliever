@@ -201,9 +201,11 @@ contract BlieverMarket_InvariantTest is StdInvariant, BlieverMarketBase {
     }
 
     /// @dev I-7: While trading is open, getMarketStatus().tradingOpen matches the internal flag.
+    ///      The contract's _tradingOpen() uses strict `<` (block.timestamp >= tradingDeadline reverts),
+    ///      so the invariant must also use strict `<` to avoid a false-positive at the exact deadline second.
     function invariant_I7_marketStatus_consistent() public view {
         (, , bool tradingOpen, , , ) = market2.getMarketStatus();
-        bool expectOpen = !market2.resolved() && block.timestamp <= market2.tradingDeadline();
+        bool expectOpen = !market2.resolved() && block.timestamp < market2.tradingDeadline();
         assertEq(tradingOpen, expectOpen, "I-7: getMarketStatus.tradingOpen is consistent");
     }
 
