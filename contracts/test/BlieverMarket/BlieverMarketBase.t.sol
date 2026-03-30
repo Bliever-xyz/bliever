@@ -4,6 +4,8 @@ pragma solidity 0.8.31;
 import {Test, console2}   from "forge-std/Test.sol";
 import {Clones}            from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC20}            from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ERC20}             from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {ERC20Permit}       from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
 
 import {BlieverMarket}    from "../../src/BlieverMarket.sol";
 import {IBlieverV1Pool}   from "../../src/interfaces/IBlieverV1Pool.sol";
@@ -15,6 +17,7 @@ import {IBlieverV1Pool}   from "../../src/interfaces/IBlieverV1Pool.sol";
 /// @dev Minimal ERC20 with 6-decimal (USDC-like) for test use.
 ///      Does NOT implement EIP-2612 permit; tests that skip permit
 ///      pass v = 0, which the market handles gracefully.
+///      For permit-path tests use MockUSDCPermit below.
 contract MockUSDC {
     string  public name     = "Mock USD Coin";
     string  public symbol   = "USDC";
@@ -58,12 +61,34 @@ contract MockUSDC {
     }
 }
 
+/// @dev ERC-20 with EIP-2612 Permit support (6-decimal, USDC-like).
+///      Used for permit tests where v != 0 signatures are required.
+///      Extends OZ ERC20Permit so nonces, DOMAIN_SEPARATOR, and permit()
+///      are all spec-compliant and usable with vm.sign() in Foundry tests.
+contract MockUSDCPermit is ERC20Permit {
+    constructor() ERC20("Mock USD Coin", "USDC") ERC20Permit("Mock USD Coin") {}
+
+    function decimals() public pure override returns (uint8) { return 6; }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+}
+
+/// @dev Minimal interface for minting test tokens.
+///      Satisfied by both MockUSDC and MockUSDCPermit.
+interface IMintable {
+    function mint(address to, uint256 amount) external;
+}
+
 /// @dev Thin spy/stub implementing IBlieverV1Pool.
+///      Accepts any ERC-20 address so the same mock works with both
+///      MockUSDC (standard tests) and MockUSDCPermit (permit tests).
 ///      Executes real USDC transfers so that the market's token-flow
 ///      assertions hold end-to-end, while remaining independent of the
 ///      full BlieverV1Pool state machine.
 contract MockPool is IBlieverV1Pool {
-    MockUSDC public immutable usdc;
+    address public immutable token;  // underlying USDC-compatible token
 
     // ── Call counters for spy assertions ──────────────────────────────────
     uint256 public collectCalls;
@@ -80,24 +105,24 @@ contract MockPool is IBlieverV1Pool {
     address public lastWinner;
     uint256 public lastClaimAmount;
 
-    constructor(MockUSDC _usdc) {
-        usdc = _usdc;
+    constructor(address _token) {
+        token = _token;
     }
 
     // ── IBlieverV1Pool ─────────────────────────────────────────────────────
 
     function asset() external view override returns (address) {
-        return address(usdc);
+        return token;
     }
 
-    /// @dev Pulls cost USDC from trader (trader must pre-approve MockPool).
+    /// @dev Pulls cost token from trader (trader must pre-approve MockPool).
     function collectTradeCost(address trader, uint256 cost, uint256 newLiability) external override {
         collectCalls++;
         lastTrader    = trader;
         lastCost      = cost;
         lastLiability = newLiability;
         if (cost > 0) {
-            usdc.transferFrom(trader, address(this), cost);
+            IERC20(token).transferFrom(trader, address(this), cost);
         }
     }
 
@@ -108,7 +133,7 @@ contract MockPool is IBlieverV1Pool {
         lastRefund    = refundAmount;
         lastLiability = newLiability;
         if (refundAmount > 0) {
-            usdc.transfer(trader, refundAmount);
+            IERC20(token).transfer(trader, refundAmount);
         }
     }
 
@@ -124,15 +149,16 @@ contract MockPool is IBlieverV1Pool {
         lastWinner      = winner;
         lastClaimAmount = amount;
         if (amount > 0) {
-            usdc.transfer(winner, amount);
+            IERC20(token).transfer(winner, amount);
         }
     }
 
     // ── Test utility ───────────────────────────────────────────────────────
 
-    /// @dev Inject USDC into the pool so refunds and claims can execute.
+    /// @dev Inject tokens into the pool so refunds and claims can execute.
+    ///      Works for both MockUSDC and MockUSDCPermit (both satisfy IMintable).
     function seed(uint256 amount) external {
-        usdc.mint(address(this), amount);
+        IMintable(token).mint(address(this), amount);
     }
 
     /// @dev Reset all counters between tests that reuse a single market.
@@ -211,6 +237,16 @@ abstract contract BlieverMarketBase is Test {
     // ── Deployment timestamp baseline ─────────────────────────────────────
     uint40  internal deployTs;
 
+    // ── Permit-capable infrastructure ─────────────────────────────────────
+    /// @dev Private key for aliceP, required for EIP-712 permit signing.
+    ///      Must be a small constant so vm.addr() deterministically gives aliceP.
+    uint256 internal constant ALICE_PK = 0xA11CE;
+
+    MockUSDCPermit  internal permitUsdc;  // EIP-2612 capable token
+    MockPool        internal permitPool;  // pool backed by permitUsdc
+    BlieverMarket   internal market2p;   // 2-outcome clone backed by permitPool
+    address         internal aliceP;     // vm.addr(ALICE_PK) — permit signer
+
     /*//////////////////////////////////////////////////////////////
                                SET UP
     //////////////////////////////////////////////////////////////*/
@@ -220,7 +256,7 @@ abstract contract BlieverMarketBase is Test {
 
         // ── Mocks ──────────────────────────────────────────────────────────
         usdc = new MockUSDC();
-        pool = new MockPool(usdc);
+        pool = new MockPool(address(usdc));
         pool.seed(POOL_SEED); // pre-fund pool for refunds / claims
 
         // ── Master implementation (initializers permanently disabled) ──────
@@ -256,6 +292,32 @@ abstract contract BlieverMarketBase is Test {
             resolver,
             factory
         );
+
+        // ── Permit-capable market (MockUSDCPermit + separate pool) ─────────
+        // Provides a real EIP-2612 token for permit happy-path and revert tests.
+        aliceP = vm.addr(ALICE_PK);
+        vm.label(aliceP, "alicePermit");
+
+        permitUsdc = new MockUSDCPermit();
+        permitPool = new MockPool(address(permitUsdc));
+        permitPool.seed(POOL_SEED);
+
+        market2p = BlieverMarket(Clones.clone(address(impl)));
+        vm.label(address(market2p), "Market_2outcome_Permit");
+        market2p.initialize(
+            address(permitPool),
+            keccak256("q2p"),
+            2,
+            ALPHA,
+            deployTs + T_TRADING,
+            deployTs + T_RESOLUTION,
+            EPSILON_2,
+            resolver,
+            factory
+        );
+
+        vm.label(address(permitUsdc), "MockUSDCPermit");
+        vm.label(address(permitPool), "MockPoolPermit");
 
         // ── Label actors ───────────────────────────────────────────────────
         vm.label(address(usdc),    "MockUSDC");
@@ -346,5 +408,43 @@ abstract contract BlieverMarketBase is Test {
     function _claimedSlot(address trader) internal pure returns (bytes32) {
         // _claimed is at sequential mapping slot 11
         return keccak256(abi.encode(trader, uint256(11)));
+    }
+
+    /// @dev Generate an EIP-2612 permit signature for `permitUsdc` using Foundry's vm.sign.
+    ///      Computes the EIP-712 digest from the token's current nonce and domain separator,
+    ///      then signs with the provided private key.
+    ///
+    /// @param owner     Address whose allowance is being authorised (must match ownerPk)
+    /// @param ownerPk   Corresponding ECDSA private key (must be known in test context)
+    /// @param spender   Address approved to spend owner's tokens
+    /// @param value     USDC amount to approve (6-dec)
+    /// @param deadline  Unix timestamp after which the permit is invalid
+    /// @return v  ECDSA signature component v
+    /// @return r  ECDSA signature component r
+    /// @return s  ECDSA signature component s
+    function _permitSignature(
+        address owner,
+        uint256 ownerPk,
+        address spender,
+        uint256 value,
+        uint256 deadline
+    ) internal view returns (uint8 v, bytes32 r, bytes32 s) {
+        bytes32 permitTypeHash = keccak256(
+            "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
+        );
+        bytes32 structHash = keccak256(abi.encode(
+            permitTypeHash,
+            owner,
+            spender,
+            value,
+            permitUsdc.nonces(owner),
+            deadline
+        ));
+        bytes32 digest = keccak256(abi.encodePacked(
+            "\x19\x01",
+            permitUsdc.DOMAIN_SEPARATOR(),
+            structHash
+        ));
+        (v, r, s) = vm.sign(ownerPk, digest);
     }
 }
