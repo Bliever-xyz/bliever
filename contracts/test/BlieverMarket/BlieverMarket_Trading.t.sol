@@ -180,8 +180,13 @@ contract BlieverMarket_TradingTest is BlieverMarketBase {
 
     function test_buy_revert_slippageExceeded() public {
         _setupTrader(alice, TRADER_USDC);
+        
+        // Fetch the exact cost the AMM will evaluate
+        uint256 costEst = market2.getBuyCost(0, SHARE_1);
+
         vm.prank(alice);
-        vm.expectRevert(BlieverMarket.SlippageExceeded.selector);
+        // Expect the full encoded error with arguments
+        vm.expectRevert(abi.encodeWithSelector(BlieverMarket.SlippageExceeded.selector, costEst, 0));
         market2.buy(0, SHARE_1, 0, 0, 0, bytes32(0), bytes32(0));
     }
 
@@ -441,7 +446,7 @@ contract BlieverMarket_TradingTest is BlieverMarketBase {
 
         // Demand more refund than the AMM will return → SlippageExceeded
         vm.prank(alice);
-        vm.expectRevert(BlieverMarket.SlippageExceeded.selector);
+        vm.expectRevert(abi.encodeWithSelector(BlieverMarket.SlippageExceeded.selector, actualRefund, actualRefund + 1e6));
         market2.sell(0, SHARE_1, actualRefund + 1e6, MAX_COST, 0, 0, bytes32(0), bytes32(0));
     }
 
@@ -545,18 +550,26 @@ contract BlieverMarket_TradingTest is BlieverMarketBase {
         (uint8 v, bytes32 r, bytes32 s) =
             _permitSignature(aliceP, ALICE_PK, address(permitPool), cap, deadline);
 
-        // Attacker front-runs and consumes the nonce
+        // Attacker front-runs: consumes nonce AND sets allowance(aliceP, pool) = cap
         vm.prank(attacker);
         permitUsdc.permit(aliceP, address(permitPool), cap, deadline, v, r, s);
 
-        // aliceP's nonce is now stale — and she has zero allowance
-        assertEq(permitUsdc.allowance(aliceP, address(permitPool)), 0, "allowance is zero after front-run");
+        // permit() always sets allowance as a side effect — it is NOT zero after the
+        // front-run.  aliceP notices and revokes the unwanted allowance.
+        vm.prank(aliceP);
+        permitUsdc.approve(address(permitPool), 0);
 
+        // Verify: nonce consumed (stale) AND allowance back to zero
+        assertEq(permitUsdc.nonces(aliceP),                         1, "nonce consumed by front-run");
+        assertEq(permitUsdc.allowance(aliceP, address(permitPool)), 0, "allowance zero after revoke");
+
+        // aliceP sends her original (now-stale) buy:
+        //   → try permit(v,r,s) → fails (nonce mismatch)
+        //   → catch: allowance(aliceP, pool) = 0 < cap → InsufficientPermitAllowance
         vm.prank(aliceP);
         vm.expectRevert(BlieverMarket.InsufficientPermitAllowance.selector);
         market2p.buy(0, SHARE_1, cap, deadline, v, r, s);
     }
-
     /// @dev Front-run path with pre-existing allowance: attacker consumes nonce but
     ///      aliceP already has sufficient allowance.  The catch block silently falls back
     ///      and the buy succeeds without reverting.
