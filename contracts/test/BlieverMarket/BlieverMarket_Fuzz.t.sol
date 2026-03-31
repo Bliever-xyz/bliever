@@ -177,8 +177,11 @@ contract BlieverMarket_FuzzTest is BlieverMarketBase {
         shareAmt = bound(shareAmt, MIN_SHARE, 100 * SHARE_1);
         _setupTrader(alice, TRADER_USDC * 100);
 
+        uint256 realCost = market2.getBuyCost(0, shareAmt);
+
         vm.prank(alice);
-        vm.expectRevert(BlieverMarket.SlippageExceeded.selector);
+        // Fully encode the expected revert parameters
+        vm.expectRevert(abi.encodeWithSelector(BlieverMarket.SlippageExceeded.selector, realCost, 0));
         market2.buy(0, shareAmt, 0, 0, 0, bytes32(0), bytes32(0));
     }
 
