@@ -29,6 +29,7 @@ import {IOptimisticRequester} from "./interfaces/IOptimisticRequester.sol";
 //////////////////////////////////////////////////////////////*/
 import {BulletinBoard}      from "./mixins/BulletinBoard.sol";
 import {MultiValueDecoder}  from "./libraries/MultiValueDecoder.sol";
+import {AncillaryDataLib}   from "./libraries/AncillaryDataLib.sol";
 
 /// @title  BlieverUmaAdapter
 /// @author Bliever Protocol
