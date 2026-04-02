@@ -150,6 +150,12 @@ contract BlieverUmaAdapter is
     /// @notice Maximum number of outcomes per market (V1 constraint, UMIP-183 supports 7 max).
     uint8 public constant MAX_OUTCOMES = MultiValueDecoder.MAX_OUTCOMES;
 
+    /// @notice Byte-length of the ",initializer:<40-char-hex-address>" suffix appended to
+    ///         raw ancillaryData by AncillaryDataLib._appendAncillaryData before hashing.
+    ///         Breakdown: 13 bytes (",initializer:") + 40 bytes (lower-case hex address) = 53.
+    ///         Raw ancillaryData passed by the factory must not exceed MAX_ANCILLARY_DATA − 53.
+    uint256 public constant INITIALIZER_SUFFIX_LENGTH = 53;
+
     // ── Role identifiers ────────────────────────────────────────────────────
 
     /// @notice Role granted to the MarketFactory.
