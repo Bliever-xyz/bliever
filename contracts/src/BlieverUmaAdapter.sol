@@ -46,7 +46,8 @@ import {AncillaryDataLib}   from "./libraries/AncillaryDataLib.sol";
 ///           • Hold, mint, or burn any ERC-20 tokens (beyond routing OO rewards).
 ///           • Touch BlieverV1Pool or the vault in any way.
 ///           • Duplicate any AMM state, share ledger, or liability tracking.
-///           • Interpret ancillary data beyond deriving keccak256(ancillaryData) == questionId.
+///           • Interpret ancillary data content beyond appending the factory initializer
+///             suffix and deriving keccak256(fullAncillaryData) == questionId.
 ///
 ///         The adapter DOES:
 ///           • Register oracle questions and submit MULTIPLE_VALUES price requests to the OO.
@@ -177,7 +178,8 @@ contract BlieverUmaAdapter is
     IOptimisticOracleV2 public optimisticOracle;
 
     /// @notice Registry of all registered questions.
-    ///         Key: keccak256(ancillaryData) == questionId == market.questionId().
+    ///         Key: keccak256(fullAncillaryData) == questionId == market.questionId().
+    ///         fullAncillaryData = raw JSON ancillaryData ++ ",initializer:" ++ hex(factory).
     mapping(bytes32 => QuestionData) public questions;
 
     /*//////////////////////////////////////////////////////////////
@@ -234,12 +236,14 @@ contract BlieverUmaAdapter is
     ///
     ///         Called by the MarketFactory in the same transaction that deploys the
     ///         EIP-1167 clone market. Atomically:
-    ///           1. Validates that questionId == keccak256(ancillaryData) == market.questionId().
-    ///           2. Validates outcomeCount ∈ [2, MAX_OUTCOMES].
-    ///           3. Persists QuestionData (market, requestTimestamp, outcomeCount, OO params, creator).
-    ///           4. Transfers reward from caller → adapter if reward > 0.
-    ///           5. Calls OO.requestPrice (MULTIPLE_VALUES, event-based, priceDisputed callback).
-    ///           6. Applies custom bond and liveness overrides via OO.setBond / OO.setCustomLiveness.
+    ///           1. Appends ",initializer:<hex(msg.sender)>" to ancillaryData via AncillaryDataLib,
+    ///              producing fullAncillaryData that carries UMA attribution for DVM voters.
+    ///           2. Validates that questionId == keccak256(fullAncillaryData) == market.questionId().
+    ///           3. Validates outcomeCount ∈ [2, MAX_OUTCOMES].
+    ///           4. Persists QuestionData (market, requestTimestamp, outcomeCount, OO params, creator).
+    ///           5. Transfers reward from caller → adapter if reward > 0.
+    ///           6. Calls OO.requestPrice (MULTIPLE_VALUES, event-based, priceDisputed callback).
+    ///           7. Applies custom bond and liveness overrides via OO.setBond / OO.setCustomLiveness.
     ///
     ///         Reward handling:
     ///           If reward > 0, the factory (caller) must have approved this adapter as spender.
@@ -247,9 +251,15 @@ contract BlieverUmaAdapter is
     ///           On resolution (or refund), the reward is either consumed by the OO or returned
     ///           to the creator.
     ///
-    /// @param questionId     keccak256(ancillaryData). Must equal market.questionId().
+    /// @param questionId     keccak256(fullAncillaryData) where fullAncillaryData is the raw JSON
+    ///                       with ",initializer:<hex(msg.sender)>" appended by this function.
+    ///                       Must equal market.questionId().
     /// @param market         BlieverMarket proxy. resolver must equal address(this).
-    /// @param ancillaryData  MULTIPLE_VALUES JSON: {title, description, labels[N]}.
+    /// @param ancillaryData  Raw MULTIPLE_VALUES JSON: {title, description, labels[N]}.
+    ///                       This function appends ",initializer:<hex(msg.sender)>" before hashing
+    ///                       and submitting to the OO. Raw length must be ≤ MAX_ANCILLARY_DATA −
+    ///                       INITIALIZER_SUFFIX_LENGTH. The factory must pre-compute questionId
+    ///                       from the full (appended) bytes off-chain.
     /// @param rewardToken    DVM-whitelisted ERC-20 for OO reward and bond.
     /// @param reward         OO proposer reward (rewardToken units; 0 is valid).
     /// @param proposalBond   Bond override (0 → OO-managed default).
@@ -267,12 +277,14 @@ contract BlieverUmaAdapter is
 
         if (market      == address(0)) revert ZeroAddress();
         if (rewardToken == address(0)) revert ZeroAddress();
-        if (ancillaryData.length == 0 || ancillaryData.length > MAX_ANCILLARY_DATA)
+        if (ancillaryData.length == 0 || ancillaryData.length > MAX_ANCILLARY_DATA - INITIALIZER_SUFFIX_LENGTH)
             revert InvalidAncillaryData();
 
-        // The questionId passed by the factory must equal keccak256(ancillaryData).
-        // This ensures the off-chain computed questionId and the on-chain hash are consistent.
-        if (keccak256(ancillaryData) != questionId) revert QuestionIdMismatch();
+        // Append the factory initializer suffix for UMA attribution on the DVM voter UI.
+        // Polymarket pattern: keccak256(raw JSON ++ ",initializer:" ++ hex(factory)) == questionId.
+        // The factory must compute questionId from fullAncillaryData off-chain before calling.
+        bytes memory fullAncillaryData = AncillaryDataLib._appendAncillaryData(msg.sender, ancillaryData);
+        if (keccak256(fullAncillaryData) != questionId) revert QuestionIdMismatch();
 
         // The market's questionId must match — ensures this adapter is the right resolver.
         if (IBlieverMarket(market).questionId() != questionId) revert QuestionIdMismatch();
@@ -304,14 +316,14 @@ contract BlieverUmaAdapter is
             reward:               reward,
             proposalBond:         proposalBond,
             liveness:             liveness,
-            ancillaryData:        ancillaryData
+            ancillaryData:        fullAncillaryData
         });
 
         // ── Submit OO Price Request ──────────────────────────────────────────
         _requestPrice(
             msg.sender,
             requestTimestamp,
-            ancillaryData,
+            fullAncillaryData,
             rewardToken,
             reward,
             proposalBond,
@@ -323,7 +335,7 @@ contract BlieverUmaAdapter is
             requestTimestamp,
             market,
             msg.sender,
-            ancillaryData,
+            fullAncillaryData,
             rewardToken,
             reward,
             proposalBond,
@@ -385,7 +397,8 @@ contract BlieverUmaAdapter is
     ///         If the question was already resolved via resolveManually() (admin acted
     ///         before the callback fired), the reward is refunded to the creator and we return.
     ///
-    /// @param ancillaryData  The request ancillary data (keccak256 → questionId).
+    /// @param ancillaryData  The full ancillary bytes echoed back by the OO (raw JSON ++
+    ///                       ",initializer:" suffix). keccak256(ancillaryData) == questionId.
     function priceDisputed(
         bytes32,
         uint256,
@@ -711,7 +724,7 @@ contract BlieverUmaAdapter is
     ///
     /// @param requestor       Address paying for the request (factory on init; adapter on reset).
     /// @param requestTimestamp Timestamp used as the OO request anchor.
-    /// @param ancillaryData   MULTIPLE_VALUES JSON bytes.
+    /// @param ancillaryData   Full ancillary bytes (raw JSON ++ ",initializer:" ++ hex(factory)).
     /// @param rewardToken     DVM-whitelisted ERC-20.
     /// @param reward          Proposer reward (0 is valid).
     /// @param bond            Custom bond override (0 → OO default).
