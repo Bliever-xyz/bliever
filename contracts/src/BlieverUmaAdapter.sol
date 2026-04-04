@@ -137,6 +137,33 @@ contract BlieverUmaAdapter is
     using MultiValueDecoder for int256;
 
     /*//////////////////////////////////////////////////////////////
+          EVENTS — SUPPLEMENT TO IBlieverUmaAdapter INTERFACE
+    //////////////////////////////////////////////////////////////
+      These events are defined here rather than in IBlieverUmaAdapter
+      because they were introduced after the initial interface cut.
+      IBlieverUmaAdapter.sol should be updated to include them so
+      external ABI consumers (SDKs, subgraphs) see a complete ABI.
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Emitted in priceDisputed when a second dispute escalates the question
+    ///         to full UMA DVM arbitration (48–96-hour token-holder vote).
+    ///         Indexers and monitoring bots must listen for this event to detect DVM
+    ///         escalation, since no other on-chain signal marks this state transition.
+    event QuestionEscalatedToDVM(bytes32 indexed questionId);
+
+    /// @notice Emitted when a best-effort reward refund fails (e.g. creator is
+    ///         USDC-blacklisted). Market settlement is unaffected — the market is
+    ///         already resolved by the time this fires.
+    ///         `amount` is the number of `token` units stranded on the adapter.
+    ///         An admin can recover them via a future upgrade or emergency function.
+    event RefundFailed(
+        bytes32 indexed questionId,
+        address indexed creator,
+        uint256         amount,
+        address indexed token
+    );
+
+    /*//////////////////////////////////////////////////////////////
                             CONSTANTS
     //////////////////////////////////////////////////////////////*/
 
@@ -389,7 +416,7 @@ contract BlieverUmaAdapter is
     ///           valid price → MultiValueDecoder.decodeWinningOutcome → market.resolve(winner).
     ///
     ///         CEI pattern: all state writes precede the external market.resolve() call.
-    ///         market.resolve() executes before _refund() — the primary settlement must never
+    ///         market.resolve() executes before _bestEffortRefund() — the primary settlement must never
     ///         be blocked by a secondary reward-return transfer.
     ///
     /// @param questionId  The oracle question identifier.
@@ -397,6 +424,9 @@ contract BlieverUmaAdapter is
         QuestionData storage qd = questions[questionId];
 
         if (!_isInitialized(qd))       revert NotInitialized();
+        // qd.paused   → operational halt via pauseQuestion() (trading suspended, OO path frozen).
+        // _isFlagged  → pending manual resolution via flag() (admin intervention in progress).
+        // These are independent states; both independently block permissionless resolution.
         if (qd.paused)                  revert QuestionIsPaused();
         if (_isFlagged(qd))             revert Flagged();
         if (qd.resolved)                revert AlreadyResolved();
@@ -417,12 +447,15 @@ contract BlieverUmaAdapter is
     ///
     ///         First dispute  → _resetQuestion: issues a fresh OO request with a new timestamp.
     ///                          Sets qd.reset = true (tracks we are on the second attempt).
-    ///         Second dispute → sets qd.refund = true. The DVM arbitration process begins.
+    ///         Second dispute → sets qd.refund = true and emits QuestionEscalatedToDVM.
+    ///                          The DVM arbitration process begins (48–96-hour token-holder vote).
     ///                          No further OO request is issued by the adapter; the DVM
     ///                          will settle the existing managed request.
     ///
     ///         If the question was already resolved via resolveManually() (admin acted
-    ///         before the callback fired), the reward is refunded to the creator and we return.
+    ///         before the callback fired), the reward is returned to the creator best-effort.
+    ///         The refund uses a try/catch so that a blacklisted creator address cannot cause
+    ///         the OO's dispute transaction to revert.
     ///
     /// @param ancillaryData  The full ancillary bytes echoed back by the OO (raw JSON ++
     ///                       ",initializer:" suffix). keccak256(ancillaryData) == questionId.
@@ -435,10 +468,12 @@ contract BlieverUmaAdapter is
         bytes32 questionId = keccak256(ancillaryData);
         QuestionData storage qd = questions[questionId];
 
-        // If already manually resolved, just refund the reward and exit.
+        // If already manually resolved, return the reward to the creator best-effort.
+        // Use try/catch so a blacklisted creator cannot cause this OO callback to revert,
+        // which would block the disputer's transaction from landing on-chain.
         if (qd.resolved) {
             if (qd.reward > 0) {
-                IERC20(qd.rewardToken).safeTransfer(qd.creator, qd.reward);
+                _bestEffortRefund(questionId, qd);
             }
             return;
         }
@@ -446,6 +481,10 @@ contract BlieverUmaAdapter is
         if (qd.reset) {
             // Second dispute: escalate to DVM — reward will be returned on resolution.
             qd.refund = true;
+            // Emit so indexers and bots can detect the 48–96-hour DVM arbitration window.
+            // Without this event there is no on-chain signal distinguishing "first dispute
+            // reset" from "second dispute escalated to full DVM vote".
+            emit QuestionEscalatedToDVM(questionId);
             return;
         }
 
@@ -524,7 +563,7 @@ contract BlieverUmaAdapter is
     ///
     ///         CEI: all QuestionData writes precede the external market.resolve() call.
     ///
-    ///         Interaction ordering: market.resolve() executes BEFORE _refund().
+    ///         Interaction ordering: market.resolve() executes BEFORE _bestEffortRefund().
     ///         The market settlement is the critical invariant; the reward refund is a
     ///         secondary concern. If the creator's address is unable to receive the reward
     ///         token (e.g. USDC blacklist), the market still settles and winners can claim.
@@ -552,8 +591,10 @@ contract BlieverUmaAdapter is
         IBlieverMarket(qd.market).resolve(winningOutcome);
 
         // ── Secondary interaction — reward refund is best-effort after settle ─
+        // Uses try/catch so a blacklisted creator address cannot revert this tx
+        // and undo the market settlement above.
         if (qd.refund && qd.reward > 0) {
-            _refund(qd);
+            _bestEffortRefund(questionId, qd);
         }
 
         emit QuestionManuallyResolved(questionId, winningOutcome);
@@ -716,9 +757,9 @@ contract BlieverUmaAdapter is
     ///      CEI pattern:
     ///        1. Write all QuestionData state changes.
     ///        2. Call market.resolve() — the critical settlement that must never be blocked.
-    ///        3. Optionally transfer reward (_refund) — secondary, best-effort after settlement.
+    ///        3. Optionally transfer reward (_bestEffortRefund) — secondary, non-reverting.
     ///
-    ///      Interaction ordering: market.resolve() runs BEFORE _refund(). This ensures that
+    ///      Interaction ordering: market.resolve() runs BEFORE _bestEffortRefund(). This ensures that
     ///      even if the creator's address cannot receive the reward token (e.g. USDC blacklist),
     ///      the market settles and winners can claim. A stuck refund never bricks the market.
     ///
@@ -758,7 +799,7 @@ contract BlieverUmaAdapter is
         //                 A self-funded reset (_requestPrice(address(this), ...))
         //                 would revert on safeTransferFrom. Flag for admin recovery
         //                 via reset(), which pulls fresh funds from EMERGENCY_ROLE.
-        if (MultiValueDecoder.isTooEarly(encodedPrice)) {
+        if (encodedPrice.isTooEarly()) {
             if (qd.reward > 0) {
                 qd.manualResolveAt = uint40(block.timestamp + SAFETY_PERIOD);
                 emit QuestionFlagged(questionId);
@@ -770,7 +811,7 @@ contract BlieverUmaAdapter is
 
         // Unresolvable (canceled event, invalid ancillary data, or > 7 labels).
         // Mark the question so the factory can call market.expireUnresolved().
-        if (MultiValueDecoder.isUnresolvable(encodedPrice)) {
+        if (encodedPrice.isUnresolvable()) {
             qd.unresolvable = true;
             emit QuestionUnresolvable(questionId);
             return;
@@ -778,25 +819,24 @@ contract BlieverUmaAdapter is
 
         // ── Decode winning outcome ───────────────────────────────────────────
         // Reverts with InvalidOracleEncoding if the encoding is malformed.
-        uint8 winningOutcome = MultiValueDecoder.decodeWinningOutcome(
-            encodedPrice,
-            qd.outcomeCount
-        );
+        uint8 winningOutcome = encodedPrice.decodeWinningOutcome(qd.outcomeCount);
 
         // ── CEI: Effects ─────────────────────────────────────────────────────
         qd.resolved = true;
 
         // ── Critical interaction — must never be blocked ──────────────────────
         // market.resolve() settles the market and releases vault liability.
-        // It executes before _refund() so that a stuck token transfer (e.g. USDC
-        // blacklist on the creator address) never prevents winners from claiming.
+        // It executes before _bestEffortRefund() so that even if the refund fails
+        // (e.g. USDC blacklist on the creator address), the market is already settled
+        // and winners can claim without waiting for admin intervention.
         IBlieverMarket(qd.market).resolve(winningOutcome);
 
-        // ── Secondary interaction — reward refund is best-effort ──────────────
-        // Executes after market settlement. If it reverts, the market is already
-        // settled and the reward remains on the adapter for manual recovery.
+        // ── Secondary interaction — best-effort reward refund ─────────────────
+        // Uses try/catch internally. If the creator cannot receive the reward token,
+        // RefundFailed is emitted and the reward remains on the adapter for recovery.
+        // The market settlement above is not affected regardless of refund outcome.
         if (qd.refund && qd.reward > 0) {
-            _refund(qd);
+            _bestEffortRefund(questionId, qd);
         }
 
         emit QuestionResolved(questionId, encodedPrice, winningOutcome);
@@ -935,8 +975,47 @@ contract BlieverUmaAdapter is
         emit QuestionReset(questionId);
     }
 
-    /// @dev Transfer the stored reward back to the question creator.
-    ///      Only called when qd.refund == true AND qd.reward > 0.
+    /// @dev Best-effort reward refund — never reverts.
+    ///
+    ///      Used in all settlement-critical paths where a failed refund must not
+    ///      unwind a market settlement or block an OO callback from landing.
+    ///
+    ///      Why `.transfer()` instead of `safeTransfer`:
+    ///        `safeTransfer` is an internal function injected by the `using SafeERC20`
+    ///        directive. Solidity's try/catch only wraps *external* ABI calls.
+    ///        Wrapping an internal library call in try/catch does not compile.
+    ///        The raw `IERC20.transfer()` is an external call on the token contract
+    ///        and CAN be wrapped in try/catch. Since the catch block handles any revert,
+    ///        the missing return-value check of safeTransfer is irrelevant here —
+    ///        both a false return and a revert are caught identically.
+    ///
+    ///      CEI: `qd.reward` is zeroed BEFORE the external transfer. Even though
+    ///        `ReentrancyGuardTransient` and `qd.resolved = true` already block
+    ///        reentry, clearing the amount first is belt-and-suspenders practice.
+    ///        The `RefundFailed` event carries the amount for admin recovery.
+    ///
+    ///      Recovery: if the catch fires, the reward tokens remain on the adapter.
+    ///        An admin can locate the stuck amount via the `RefundFailed` event log
+    ///        and recover via a future upgrade or a dedicated admin rescue function.
+    ///
+    /// @param questionId  Used for the RefundFailed event index.
+    /// @param qd          Storage pointer to the question's data.
+    function _bestEffortRefund(bytes32 questionId, QuestionData storage qd) internal {
+        uint256 amount  = qd.reward;
+        qd.reward       = 0; // CEI: clear before external call
+        // solhint-disable-next-line no-empty-blocks
+        try IERC20(qd.rewardToken).transfer(qd.creator, amount) {}
+        catch {
+            // Creator cannot receive the reward token (e.g. USDC blacklist).
+            // Market is already settled — this event is the admin's recovery signal.
+            emit RefundFailed(questionId, qd.creator, amount, qd.rewardToken);
+        }
+    }
+
+    /// @dev Hard-reverting reward refund. Used ONLY in admin-path functions (reset())
+    ///      where reverting is acceptable — the market is not yet settled and admin
+    ///      can address the root cause (blacklist, token pause) before retrying.
+    ///      Do NOT call this from settlement-critical paths; use _bestEffortRefund instead.
     function _refund(QuestionData storage qd) internal {
         IERC20(qd.rewardToken).safeTransfer(qd.creator, qd.reward);
     }
