@@ -108,8 +108,11 @@ import {AncillaryDataLib}   from "./libraries/AncillaryDataLib.sol";
 ///         (EIP-1167 with no upgrade logic) — they pin a single resolver address. When a
 ///         new oracle version is released, the admin:
 ///           1. Calls updateOptimisticOracle(newOO) on this adapter proxy (no market changes).
-///           2. New questions use the new OO. Already-initialized questions continue with the
-///              old OO stored in their QuestionData.requestTimestamp / ancillaryData key.
+///           2. New questions use newOO; their _questionOracle snapshot is set at init time.
+///           3. Already-initialized questions retain their _questionOracle snapshot (old OO).
+///              hasPrice and settleAndGetPrice for those questions still route to the old OO.
+///              priceDisputed callbacks from the old OO are accepted via _knownOracles tracking.
+///           4. No active questions are bricked by an OO upgrade. Upgrades are safe at any time.
 ///
 /// @dev    Inherits:
 ///           Initializable          — UUPS-compatible upgradeable init guard.
@@ -171,16 +174,28 @@ contract BlieverUmaAdapter is
                             STORAGE
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice The UMA ManagedOptimisticOracleV2 used for all price requests.
+    /// @notice The UMA ManagedOptimisticOracleV2 used for all NEW price requests.
     ///         Updatable by DEFAULT_ADMIN_ROLE to support OO version upgrades.
-    ///         New questions use this address; historical questions retain their stored
-    ///         requestTimestamp keys (OO routes by requester+identifier+timestamp+data).
+    ///         Per-question oracle tracking (_questionOracle) ensures historical questions
+    ///         always resolve against the exact OO instance they were submitted to.
     IOptimisticOracleV2 public optimisticOracle;
 
     /// @notice Registry of all registered questions.
     ///         Key: keccak256(fullAncillaryData) == questionId == market.questionId().
     ///         fullAncillaryData = raw JSON ancillaryData ++ ",initializer:" ++ hex(factory).
     mapping(bytes32 => QuestionData) public questions;
+
+    /// @notice Records every OO address ever assigned to this adapter.
+    ///         Used by the onlyOptimisticOracle modifier so that priceDisputed callbacks
+    ///         from a previously-active oracle (before an upgrade) are still accepted for
+    ///         questions that were initialized on that oracle.
+    mapping(address => bool) private _knownOracles;
+
+    /// @notice Records the OO instance active at the time each question was initialized
+    ///         (or last reset). All hasPrice and settleAndGetPrice calls for a given question
+    ///         route to this address, not the current global optimisticOracle.
+    ///         Prevents resolution failure after an oracle upgrade while live questions exist.
+    mapping(bytes32 => IOptimisticOracleV2) private _questionOracle;
 
     /*//////////////////////////////////////////////////////////////
                             CONSTRUCTOR
@@ -225,7 +240,8 @@ contract BlieverUmaAdapter is
         _grantRole(EMERGENCY_ROLE,     _emergency);
 
         // ── Oracle ───────────────────────────────────────────────────────────
-        optimisticOracle = IOptimisticOracleV2(_optimisticOracle);
+        optimisticOracle              = IOptimisticOracleV2(_optimisticOracle);
+        _knownOracles[_optimisticOracle] = true;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -319,6 +335,12 @@ contract BlieverUmaAdapter is
             ancillaryData:        fullAncillaryData
         });
 
+        // Snapshot the active oracle for this question's entire lifecycle.
+        // _hasPrice and settleAndGetPrice always use this address, not the
+        // current global optimisticOracle, so oracle upgrades never break
+        // the resolution path for in-flight questions.
+        _questionOracle[questionId] = optimisticOracle;
+
         // ── Submit OO Price Request ──────────────────────────────────────────
         _requestPrice(
             msg.sender,
@@ -348,10 +370,10 @@ contract BlieverUmaAdapter is
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Returns true when the OO has a settled price and the question is ready
-    ///         to be resolved (initialized, unpaused, not yet resolved or unresolvable).
+    ///         to be resolved (initialized, unpaused, not flagged, not yet resolved or unresolvable).
     /// @param questionId  The oracle question identifier.
     function ready(bytes32 questionId) external view returns (bool) {
-        return _ready(questions[questionId]);
+        return _ready(questionId, questions[questionId]);
     }
 
     /// @notice Settle the OO request and dispatch the result to the BlieverMarket.
@@ -359,22 +381,27 @@ contract BlieverUmaAdapter is
     ///         Permissionless — any EOA may call once ready() == true.
     ///
     ///         MULTIPLE_VALUES dispatch logic:
-    ///           int256.min (too early) → _resetQuestion (new OO request at new timestamp).
+    ///           int256.min (too early, reward == 0) → _resetQuestion (new OO request at new timestamp).
+    ///           int256.min (too early, reward  > 0) → flag for admin: reward was consumed by the OO;
+    ///                                                  adapter cannot self-fund a new request safely.
     ///           int256.max (unresolvable) → mark unresolvable, emit QuestionUnresolvable.
     ///                                        Factory must call market.expireUnresolved().
     ///           valid price → MultiValueDecoder.decodeWinningOutcome → market.resolve(winner).
     ///
     ///         CEI pattern: all state writes precede the external market.resolve() call.
+    ///         market.resolve() executes before _refund() — the primary settlement must never
+    ///         be blocked by a secondary reward-return transfer.
     ///
     /// @param questionId  The oracle question identifier.
     function resolve(bytes32 questionId) external nonReentrant whenNotPaused {
         QuestionData storage qd = questions[questionId];
 
-        if (!_isInitialized(qd))  revert NotInitialized();
-        if (qd.paused)            revert QuestionIsPaused();
-        if (qd.resolved)          revert AlreadyResolved();
-        if (qd.unresolvable)      revert Unresolvable();
-        if (!_hasPrice(qd))       revert PriceNotAvailable();
+        if (!_isInitialized(qd))       revert NotInitialized();
+        if (qd.paused)                  revert QuestionIsPaused();
+        if (_isFlagged(qd))             revert Flagged();
+        if (qd.resolved)                revert AlreadyResolved();
+        if (qd.unresolvable)            revert Unresolvable();
+        if (!_hasPrice(questionId, qd)) revert PriceNotAvailable();
 
         _decodeAndResolve(questionId, qd);
     }
@@ -435,8 +462,13 @@ contract BlieverUmaAdapter is
 
     /// @notice Flag a question for manual resolution after a 1-hour safety delay.
     ///
-    ///         Sets qd.paused = true, blocking the permissionless resolve() path.
-    ///         EMERGENCY_ROLE must call resolveManually() after SAFETY_PERIOD elapses.
+    ///         Sets qd.manualResolveAt, which causes resolve() to revert with Flagged.
+    ///         The permissionless resolve() path is blocked; EMERGENCY_ROLE must call
+    ///         resolveManually() after SAFETY_PERIOD elapses.
+    ///
+    ///         This function intentionally does NOT touch qd.paused. The pause state
+    ///         managed by pauseQuestion() is independent of the flag state. An admin
+    ///         calling unflag() will never silently undo a prior pauseQuestion() call.
     ///
     ///         Use cases:
     ///           • The UMA DVM returns a result that is demonstrably incorrect (e.g.
@@ -456,14 +488,16 @@ contract BlieverUmaAdapter is
         if (qd.resolved)         revert AlreadyResolved();
 
         qd.manualResolveAt = uint40(block.timestamp + SAFETY_PERIOD);
-        qd.paused          = true;
 
         emit QuestionFlagged(questionId);
     }
 
     /// @notice Unflag a question before the safety period has elapsed.
-    ///         Restores qd.paused = false so the optimistic OO path resumes.
+    ///         Clears qd.manualResolveAt so the optimistic OO path resumes.
     ///         Cannot be called after the safety period ends (to prevent admin indecision).
+    ///
+    ///         Does NOT modify qd.paused. If the question was explicitly paused via
+    ///         pauseQuestion() before or after flag(), that pause state is preserved.
     ///
     /// @param questionId  The oracle question identifier.
     function unflag(bytes32 questionId)
@@ -479,7 +513,6 @@ contract BlieverUmaAdapter is
         if (block.timestamp >= qd.manualResolveAt)     revert SafetyPeriodPassed();
 
         qd.manualResolveAt = 0;
-        qd.paused          = false;
 
         emit QuestionUnflagged(questionId);
     }
@@ -491,8 +524,10 @@ contract BlieverUmaAdapter is
     ///
     ///         CEI: all QuestionData writes precede the external market.resolve() call.
     ///
-    ///         Refund: if qd.refund == true (reward is sitting on this contract), return
-    ///         the reward to the creator on manual resolution.
+    ///         Interaction ordering: market.resolve() executes BEFORE _refund().
+    ///         The market settlement is the critical invariant; the reward refund is a
+    ///         secondary concern. If the creator's address is unable to receive the reward
+    ///         token (e.g. USDC blacklist), the market still settles and winners can claim.
     ///
     /// @param questionId     The oracle question identifier.
     /// @param winningOutcome The winning outcome index [0, outcomeCount).
@@ -513,14 +548,13 @@ contract BlieverUmaAdapter is
         // ── Effects (CEI) ────────────────────────────────────────────────────
         qd.resolved = true;
 
-        // If reward is sitting on the adapter (refund flag set by second dispute),
-        // return it to the question creator before calling into the market.
+        // ── Critical interaction — must never be blocked ─────────────────────
+        IBlieverMarket(qd.market).resolve(winningOutcome);
+
+        // ── Secondary interaction — reward refund is best-effort after settle ─
         if (qd.refund && qd.reward > 0) {
             _refund(qd);
         }
-
-        // ── Interaction ──────────────────────────────────────────────────────
-        IBlieverMarket(qd.market).resolve(winningOutcome);
 
         emit QuestionManuallyResolved(questionId, winningOutcome);
     }
@@ -529,6 +563,8 @@ contract BlieverUmaAdapter is
     ///
     ///         Used when the priceDisputed OO callback fails to fire due to an OO-side
     ///         bug or an edge-case in the managed oracle's callback routing.
+    ///         Also used to recover from a TOO_EARLY + reward > 0 flag, where the
+    ///         caller (EMERGENCY_ROLE) funds the new request from their own balance.
     ///         The caller (EMERGENCY_ROLE) pays for the new price request reward.
     ///
     /// @param questionId  The oracle question identifier.
@@ -545,6 +581,13 @@ contract BlieverUmaAdapter is
         // If reward is sitting on the adapter, return it before resetting.
         if (qd.refund && qd.reward > 0) {
             _refund(qd);
+        }
+
+        // If the question was flagged (e.g. by the TOO_EARLY + reward > 0 path),
+        // clear the flag so the fresh OO request can proceed normally.
+        if (_isFlagged(qd)) {
+            qd.manualResolveAt = 0;
+            emit QuestionUnflagged(questionId);
         }
 
         // Reset, paying for new request from the caller (emergency admin).
@@ -595,11 +638,17 @@ contract BlieverUmaAdapter is
 
     /// @notice Update the OO address when UMA releases a new oracle version.
     ///
-    ///         New questions will use the updated OO.
-    ///         Already-initialized questions continue using their stored OO via their
-    ///         requestTimestamp key; the managed OO routes by (requester, identifier,
-    ///         timestamp, ancillaryData) so historical request keys remain valid on the
-    ///         old OO contract.
+    ///         New questions will use the updated OO; their _questionOracle snapshot
+    ///         is recorded at initializeQuestion time so they always route to newOracle.
+    ///
+    ///         Already-initialized questions are unaffected: each question's
+    ///         _questionOracle snapshot still points to the OO it was submitted to.
+    ///         Their hasPrice and settleAndGetPrice calls continue to route to the
+    ///         original oracle. priceDisputed callbacks from the old OO are still
+    ///         accepted because _knownOracles tracks every OO ever assigned here.
+    ///
+    ///         This means oracle upgrades are safe at any time — live questions
+    ///         will continue resolving via their pinned OO instance.
     ///
     ///         Security note: only DEFAULT_ADMIN_ROLE (governance multisig) can call this.
     ///         Any existing price request allowances on the old OO must be revoked manually
@@ -613,7 +662,8 @@ contract BlieverUmaAdapter is
     {
         if (newOracle == address(0)) revert ZeroAddress();
         address oldOracle = address(optimisticOracle);
-        optimisticOracle  = IOptimisticOracleV2(newOracle);
+        optimisticOracle             = IOptimisticOracleV2(newOracle);
+        _knownOracles[newOracle]     = true;
         emit OptimisticOracleUpdated(oldOracle, newOracle);
     }
 
@@ -640,6 +690,17 @@ contract BlieverUmaAdapter is
         return _isFlagged(questions[questionId]);
     }
 
+    /// @notice Returns the OO instance that this question's price request was submitted to.
+    ///         This is the address used for all hasPrice and settleAndGetPrice calls
+    ///         for this question, regardless of any subsequent updateOptimisticOracle calls.
+    function getQuestionOracle(bytes32 questionId)
+        external
+        view
+        returns (address)
+    {
+        return address(_questionOracle[questionId]);
+    }
+
     /*//////////////////////////////////////////////////////////////
                     INTERNAL — RESOLUTION CORE
     //////////////////////////////////////////////////////////////*/
@@ -647,10 +708,19 @@ contract BlieverUmaAdapter is
     /// @dev Calls OO.settleAndGetPrice, decodes the MULTIPLE_VALUES price, and
     ///      dispatches to market.resolve(winningOutcome).  Called by the public resolve().
     ///
+    ///      Routes settleAndGetPrice to _questionOracle[questionId], not the global
+    ///      optimisticOracle. This guarantees resolution succeeds even after an oracle
+    ///      upgrade, since the per-question snapshot always points to the OO instance
+    ///      that holds the actual settled request.
+    ///
     ///      CEI pattern:
     ///        1. Write all QuestionData state changes.
-    ///        2. Optionally transfer reward (ERC-20 external call).
-    ///        3. Call market.resolve() (external call into BlieverMarket clone).
+    ///        2. Call market.resolve() — the critical settlement that must never be blocked.
+    ///        3. Optionally transfer reward (_refund) — secondary, best-effort after settlement.
+    ///
+    ///      Interaction ordering: market.resolve() runs BEFORE _refund(). This ensures that
+    ///      even if the creator's address cannot receive the reward token (e.g. USDC blacklist),
+    ///      the market settles and winners can claim. A stuck refund never bricks the market.
     ///
     ///      The OO.settleAndGetPrice call happens first (before CEI writes) because:
     ///        a. It is required to obtain the price — no alternative.
@@ -663,10 +733,13 @@ contract BlieverUmaAdapter is
         bytes32               questionId,
         QuestionData storage  qd
     ) internal {
-        // ── Fetch settled price from the OO ─────────────────────────────────
+        // ── Fetch settled price from the question's pinned OO instance ────────
+        // Route to _questionOracle[questionId], not the global optimisticOracle,
+        // so that an oracle upgrade between question init and resolution does not
+        // cause this call to target an OO that knows nothing about the request.
         // OO.settleAndGetPrice also distributes bonds; must be called once to
         // finalize the request. Reverts if price is not yet available.
-        int256 encodedPrice = optimisticOracle.settleAndGetPrice(
+        int256 encodedPrice = _questionOracle[questionId].settleAndGetPrice(
             MULTIPLE_VALUES_IDENTIFIER,
             qd.requestTimestamp,
             qd.ancillaryData
@@ -676,9 +749,22 @@ contract BlieverUmaAdapter is
 
         // Too early (event-based expiry before game start).
         // The OO returns type(int256).min when a proposal was submitted before
-        // the event's anchor timestamp.  We reset the question to re-request.
+        // the event's anchor timestamp.
+        //
+        // Branch on reward to avoid draining the adapter:
+        //   reward == 0 → auto-reset is safe; no token transfer risk.
+        //   reward  > 0 → UMA consumed the reward on TOO_EARLY settlement and will
+        //                 not refund it. The adapter balance is now 0 for this token.
+        //                 A self-funded reset (_requestPrice(address(this), ...))
+        //                 would revert on safeTransferFrom. Flag for admin recovery
+        //                 via reset(), which pulls fresh funds from EMERGENCY_ROLE.
         if (MultiValueDecoder.isTooEarly(encodedPrice)) {
-            _resetQuestion(address(this), questionId, true, qd);
+            if (qd.reward > 0) {
+                qd.manualResolveAt = uint40(block.timestamp + SAFETY_PERIOD);
+                emit QuestionFlagged(questionId);
+            } else {
+                _resetQuestion(address(this), questionId, true, qd);
+            }
             return;
         }
 
@@ -697,17 +783,21 @@ contract BlieverUmaAdapter is
             qd.outcomeCount
         );
 
-        // ── CEI: Effects before interaction ─────────────────────────────────
+        // ── CEI: Effects ─────────────────────────────────────────────────────
         qd.resolved = true;
 
-        // If reward is sitting on this adapter (refund flag from second dispute),
-        // return it to the creator.
+        // ── Critical interaction — must never be blocked ──────────────────────
+        // market.resolve() settles the market and releases vault liability.
+        // It executes before _refund() so that a stuck token transfer (e.g. USDC
+        // blacklist on the creator address) never prevents winners from claiming.
+        IBlieverMarket(qd.market).resolve(winningOutcome);
+
+        // ── Secondary interaction — reward refund is best-effort ──────────────
+        // Executes after market settlement. If it reverts, the market is already
+        // settled and the reward remains on the adapter for manual recovery.
         if (qd.refund && qd.reward > 0) {
             _refund(qd);
         }
-
-        // ── Interaction: notify the BlieverMarket clone ──────────────────────
-        IBlieverMarket(qd.market).resolve(winningOutcome);
 
         emit QuestionResolved(questionId, encodedPrice, winningOutcome);
     }
@@ -802,12 +892,16 @@ contract BlieverUmaAdapter is
     ///
     ///      Called on:
     ///        1. First dispute (priceDisputed callback, resetRefund = false).
-    ///        2. TOO_EARLY_PRICE resolution (_decodeAndResolve, resetRefund = true).
+    ///        2. TOO_EARLY_PRICE resolution with reward == 0 (_decodeAndResolve, resetRefund = true).
     ///        3. Admin reset() failsafe (resetRefund = true).
     ///
     ///      The new requestTimestamp is block.timestamp at the time of reset.
     ///      This aligns the new OO request anchor with the current block, ensuring
     ///      event-based proposals for the reset request are correctly time-gated.
+    ///
+    ///      After issuing the new request, _questionOracle[questionId] is updated to
+    ///      the current global optimisticOracle so future hasPrice and settleAndGetPrice
+    ///      calls for this question route to the correct OO instance.
     ///
     /// @param requestor    Address paying for the new OO request (adapter or admin).
     /// @param questionId   The oracle question identifier.
@@ -823,6 +917,10 @@ contract BlieverUmaAdapter is
         qd.requestTimestamp = newTimestamp;
         qd.reset            = true;
         if (resetRefund) qd.refund = false;
+
+        // Snapshot the current global oracle for this question's new request.
+        // Subsequent _hasPrice and settleAndGetPrice calls will route here.
+        _questionOracle[questionId] = optimisticOracle;
 
         _requestPrice(
             requestor,
@@ -858,17 +956,20 @@ contract BlieverUmaAdapter is
     }
 
     /// @dev Returns true when all preconditions for permissionless resolve() are met.
-    function _ready(QuestionData storage qd) internal view returns (bool) {
+    function _ready(bytes32 questionId, QuestionData storage qd) internal view returns (bool) {
         if (!_isInitialized(qd)) return false;
         if (qd.paused)           return false;
+        if (_isFlagged(qd))      return false;
         if (qd.resolved)         return false;
         if (qd.unresolvable)     return false;
-        return _hasPrice(qd);
+        return _hasPrice(questionId, qd);
     }
 
-    /// @dev Checks whether the OO holds a settled price for this question's active request.
-    function _hasPrice(QuestionData storage qd) internal view returns (bool) {
-        return optimisticOracle.hasPrice(
+    /// @dev Checks whether the question's pinned OO instance holds a settled price
+    ///      for this question's active request. Routes to _questionOracle[questionId]
+    ///      so that an oracle upgrade never causes the check to query the wrong OO.
+    function _hasPrice(bytes32 questionId, QuestionData storage qd) internal view returns (bool) {
+        return _questionOracle[questionId].hasPrice(
             address(this),
             MULTIPLE_VALUES_IDENTIFIER,
             qd.requestTimestamp,
@@ -880,10 +981,14 @@ contract BlieverUmaAdapter is
                     INTERNAL — MODIFIERS
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Reverts if the caller is not the currently configured optimistic oracle.
-    ///      Used to guard the priceDisputed callback.
+    /// @dev Reverts if the caller is not a known optimistic oracle address.
+    ///      Accepts callbacks from any OO ever assigned to this adapter, not only the
+    ///      current global optimisticOracle. This is required because a priceDisputed
+    ///      callback for a question initialized on the old OO will still come from the
+    ///      old OO address even after updateOptimisticOracle has been called. Restricting
+    ///      to the current OO only would silently drop those legitimate callbacks.
     modifier onlyOptimisticOracle() {
-        if (msg.sender != address(optimisticOracle)) revert NotOptimisticOracle();
+        if (!_knownOracles[msg.sender]) revert NotOptimisticOracle();
         _;
     }
 
