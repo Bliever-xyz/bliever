@@ -259,7 +259,6 @@ contract BlieverUmaAdapter is
         // ── OZ Upgradeable Initialisers ─────────────────────────────────────
         __AccessControl_init();
         __Pausable_init();
-        __UUPSUpgradeable_init();
 
         // ── Role Setup ───────────────────────────────────────────────────────
         _grantRole(DEFAULT_ADMIN_ROLE, _admin);
@@ -419,19 +418,25 @@ contract BlieverUmaAdapter is
     ///         market.resolve() executes before _bestEffortRefund() — the primary settlement must never
     ///         be blocked by a secondary reward-return transfer.
     ///
+    ///         Price availability: _hasPrice() is NOT called here. If the OO has not yet
+    ///         settled the request, settleAndGetPrice() inside _decodeAndResolve() will
+    ///         revert with the OO's native error. Use ready() for off-chain polling.
+    ///
     /// @param questionId  The oracle question identifier.
     function resolve(bytes32 questionId) external nonReentrant whenNotPaused {
         QuestionData storage qd = questions[questionId];
 
-        if (!_isInitialized(qd))       revert NotInitialized();
+        if (!_isInitialized(qd))  revert NotInitialized();
         // qd.paused   → operational halt via pauseQuestion() (trading suspended, OO path frozen).
         // _isFlagged  → pending manual resolution via flag() (admin intervention in progress).
         // These are independent states; both independently block permissionless resolution.
-        if (qd.paused)                  revert QuestionIsPaused();
-        if (_isFlagged(qd))             revert Flagged();
-        if (qd.resolved)                revert AlreadyResolved();
-        if (qd.unresolvable)            revert Unresolvable();
-        if (!_hasPrice(questionId, qd)) revert PriceNotAvailable();
+        if (qd.paused)             revert QuestionIsPaused();
+        if (_isFlagged(qd))        revert Flagged();
+        if (qd.resolved)           revert AlreadyResolved();
+        if (qd.unresolvable)       revert Unresolvable();
+        // Price availability is not checked here. settleAndGetPrice() in _decodeAndResolve
+        // reverts with the OO's native error when the liveness window has not yet closed.
+        // Callers should verify ready(questionId) == true off-chain before submitting.
 
         _decodeAndResolve(questionId, qd);
     }
@@ -985,9 +990,10 @@ contract BlieverUmaAdapter is
     ///        directive. Solidity's try/catch only wraps *external* ABI calls.
     ///        Wrapping an internal library call in try/catch does not compile.
     ///        The raw `IERC20.transfer()` is an external call on the token contract
-    ///        and CAN be wrapped in try/catch. Since the catch block handles any revert,
-    ///        the missing return-value check of safeTransfer is irrelevant here —
-    ///        both a false return and a revert are caught identically.
+    ///        and CAN be wrapped in try/catch. The return bool is explicitly captured
+    ///        in the `returns` clause so that non-reverting tokens which signal failure
+    ///        by returning false (rather than reverting) are correctly detected — a
+    ///        false return fires RefundFailed just as a hard revert does.
     ///
     ///      CEI: `qd.reward` is zeroed BEFORE the external transfer. Even though
     ///        `ReentrancyGuardTransient` and `qd.resolved = true` already block
@@ -1003,10 +1009,14 @@ contract BlieverUmaAdapter is
     function _bestEffortRefund(bytes32 questionId, QuestionData storage qd) internal {
         uint256 amount  = qd.reward;
         qd.reward       = 0; // CEI: clear before external call
-        // solhint-disable-next-line no-empty-blocks
-        try IERC20(qd.rewardToken).transfer(qd.creator, amount) {}
-        catch {
-            // Creator cannot receive the reward token (e.g. USDC blacklist).
+        try IERC20(qd.rewardToken).transfer(qd.creator, amount) returns (bool success) {
+            if (!success) {
+                // Non-reverting failure: token returned false without reverting.
+                // Market is already settled — this event is the admin's recovery signal.
+                emit RefundFailed(questionId, qd.creator, amount, qd.rewardToken);
+            }
+        } catch {
+            // Hard revert path: creator cannot receive the token (e.g. USDC blacklist).
             // Market is already settled — this event is the admin's recovery signal.
             emit RefundFailed(questionId, qd.creator, amount, qd.rewardToken);
         }
