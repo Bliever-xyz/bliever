@@ -143,23 +143,6 @@ library MultiValueDecoder {
         if (!found) revert InvalidOracleEncoding(); // no winner
     }
 
-    /// @notice Encode N winning-outcome values into the MULTIPLE_VALUES int256 format.
-    ///         Utility for off-chain callers and tests — not used in the hot resolution path.
-    ///         values[winnerIndex] must equal 1; all others must equal 0.
-    ///
-    /// @param values  Array of uint32 values (length ≤ MAX_OUTCOMES).
-    /// @return encodedPrice  The packed int256 representation.
-    function encodeValues(uint32[] memory values) internal pure returns (int256 encodedPrice) {
-        require(values.length <= MAX_OUTCOMES, "MultiValueDecoder: too many values");
-        uint256 raw;
-        unchecked {
-            for (uint256 i = 0; i < values.length; ++i) {
-                raw |= uint256(values[i]) << (32 * i);
-            }
-        }
-        encodedPrice = int256(raw);
-    }
-
     /*//////////////////////////////////////////////////////////////
                           INTERNAL HELPERS
     //////////////////////////////////////////////////////////////*/
