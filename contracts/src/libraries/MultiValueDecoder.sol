@@ -68,9 +68,17 @@ library MultiValueDecoder {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice The decoded int256 does not satisfy the single-winner contract.
-    ///         Emitted when: no winner found, multiple winners, trailing garbage bits,
+    ///         Thrown when: no winner found, multiple winners, trailing garbage bits,
     ///         or any uint32 slot > 1 in a position within [0, outcomeCount).
-    error InvalidOracleEncoding();
+    ///
+    /// @param price         The raw int256 that failed validation (pre-sentinel-checked).
+    /// @param outcomeCount  The number of outcomes the market registered, passed to decodeWinningOutcome.
+    ///
+    /// @dev  No on-chain gas cost above a bare custom error: ABI-encoded parameters only appear
+    ///       in the reverted call's returndata and are never written to storage.
+    ///       Off-chain consumers (monitoring bots, tests, block explorers) can decode the revert
+    ///       data directly to recover the exact price and outcomeCount without replaying the call.
+    error InvalidOracleEncoding(int256 price, uint8 outcomeCount);
 
     /*//////////////////////////////////////////////////////////////
                            PUBLIC FUNCTIONS
@@ -115,13 +123,13 @@ library MultiValueDecoder {
         // ── Rule 1: Top 32 bits must be zero ────────────────────────────────
         // UMIP-183 §Implementation: "The most significant 32 bits are always unused
         // to prevent collisions with the other valid responses."
-        if (raw & TOP_BITS_MASK != 0) revert InvalidOracleEncoding();
+        if (raw & TOP_BITS_MASK != 0) revert InvalidOracleEncoding(encodedPrice, outcomeCount);
 
         // ── Rule 2: Trailing slots [outcomeCount, MAX_OUTCOMES) must be zero ─
         // Prevents garbage data in unused label positions from masking a corrupt encoding.
         unchecked {
             for (uint256 i = outcomeCount; i < MAX_OUTCOMES; ++i) {
-                if (_slotAt(raw, i) != 0) revert InvalidOracleEncoding();
+                if (_slotAt(raw, i) != 0) revert InvalidOracleEncoding(encodedPrice, outcomeCount);
             }
         }
 
@@ -131,16 +139,16 @@ library MultiValueDecoder {
             for (uint256 i = 0; i < outcomeCount; ++i) {
                 uint32 val = _slotAt(raw, i);
                 if (val == 1) {
-                    if (found) revert InvalidOracleEncoding(); // duplicate winner
+                    if (found) revert InvalidOracleEncoding(encodedPrice, outcomeCount); // duplicate winner
                     found = true;
                     winningOutcome = uint8(i);
                 } else if (val != 0) {
-                    revert InvalidOracleEncoding(); // slot value not 0 or 1
+                    revert InvalidOracleEncoding(encodedPrice, outcomeCount); // slot value not 0 or 1
                 }
             }
         }
 
-        if (!found) revert InvalidOracleEncoding(); // no winner
+        if (!found) revert InvalidOracleEncoding(encodedPrice, outcomeCount); // no winner
     }
 
     /*//////////////////////////////////////////////////////////////
