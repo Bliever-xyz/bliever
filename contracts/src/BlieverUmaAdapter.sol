@@ -145,6 +145,13 @@ contract BlieverUmaAdapter is
       external ABI consumers (SDKs, subgraphs) see a complete ABI.
     //////////////////////////////////////////////////////////////*/
 
+    // ── Implementation-only error ────────────────────────────────────────────
+    /// @dev Reverts when _tryResetQuestion is called by any address other than
+    ///      the adapter itself. This function is external only to satisfy
+    ///      Solidity's try/catch requirement (which only works on external calls).
+    ///      No external caller should ever invoke it directly.
+    error BlieverUmaAdapter__OnlySelf();
+
     /// @notice Emitted in priceDisputed when a second dispute escalates the question
     ///         to full UMA DVM arbitration (48–96-hour token-holder vote).
     ///         Indexers and monitoring bots must listen for this event to detect DVM
@@ -466,12 +473,18 @@ contract BlieverUmaAdapter is
     ///                       ",initializer:" suffix). keccak256(ancillaryData) == questionId.
     function priceDisputed(
         bytes32,
-        uint256,
+        uint256 timestamp,
         bytes memory ancillaryData,
         uint256
     ) external override onlyOptimisticOracle {
         bytes32 questionId = keccak256(ancillaryData);
         QuestionData storage qd = questions[questionId];
+
+        // Timestamp guard: silently ignore callbacks that do not match the active
+        // request timestamp. Defends against stale OO callbacks from a superseded
+        // request (e.g. a callback arriving after the question was already reset)
+        // triggering erroneous state transitions on the current question state.
+        if (timestamp != qd.requestTimestamp) return;
 
         // If already manually resolved, return the reward to the creator best-effort.
         // Use try/catch so a blacklisted creator cannot cause this OO callback to revert,
@@ -493,8 +506,25 @@ contract BlieverUmaAdapter is
             return;
         }
 
-        // First dispute: reset the question (new OO request).
-        _resetQuestion(address(this), questionId, false, qd);
+        // First dispute: attempt reset (new OO request).
+        //
+        // _resetQuestion routes through _requestPrice, which may revert if the reward
+        // token is paused or the OO is temporarily unavailable. If it reverts, the
+        // disputer's OO transaction would also revert — permanently blocking dispute
+        // economics for this question. Wrapping the call in try/catch ensures the OO
+        // callback ALWAYS lands. On failure, the question is flagged for admin recovery
+        // via reset() rather than silently blocking the dispute system.
+        //
+        // _tryResetQuestion is an external self-call wrapper (this.X) required because
+        // Solidity try/catch only works on external ABI calls, not internal functions.
+        // It is access-guarded to reject any caller other than address(this).
+        try this._tryResetQuestion(address(this), questionId, false) {
+            // Reset succeeded — new OO request issued with updated requestTimestamp.
+        } catch {
+            // Reset failed — flag for EMERGENCY_ROLE recovery via reset().
+            qd.manualResolveAt = uint40(block.timestamp + SAFETY_PERIOD);
+            emit QuestionFlagged(questionId);
+        }
     }
 
     /// @notice No-op — the adapter does not enable priceSettled callbacks.
@@ -931,6 +961,33 @@ contract BlieverUmaAdapter is
                 liveness
             );
         }
+    }
+
+    /// @dev External self-call wrapper that enables try/catch around _resetQuestion
+    ///      in priceDisputed. Solidity try/catch only wraps genuine external ABI calls;
+    ///      internal function calls cannot be wrapped. By routing through `this.X`,
+    ///      the adapter catches reversion without propagating it to the disputer's tx.
+    ///
+    ///      Access guard: rejects any caller that is not address(this). The function
+    ///      is only valid inside the `try this._tryResetQuestion(...)` block in
+    ///      priceDisputed. Exposing it publicly (required by `external` visibility)
+    ///      is safe because the access guard prevents unauthorized calls.
+    ///
+    ///      Storage: questionId is re-resolved via the `questions` mapping inside the
+    ///      external frame. Solidity prohibits passing storage pointers cross-frame
+    ///      to external functions; re-resolving the storage pointer is equivalent and
+    ///      writes to the same proxy storage slots.
+    ///
+    /// @param requestor    Address paying for the new OO request (typically address(this)).
+    /// @param questionId   The oracle question identifier.
+    /// @param resetRefund  If true, clear the refund flag.
+    function _tryResetQuestion(
+        address requestor,
+        bytes32 questionId,
+        bool    resetRefund
+    ) external {
+        if (msg.sender != address(this)) revert BlieverUmaAdapter__OnlySelf();
+        _resetQuestion(requestor, questionId, resetRefund, questions[questionId]);
     }
 
     /// @dev Reset a question: update requestTimestamp, set reset flag, issue new OO request.
