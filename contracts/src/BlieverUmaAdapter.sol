@@ -136,39 +136,12 @@ contract BlieverUmaAdapter is
     using SafeERC20 for IERC20;
     using MultiValueDecoder for int256;
 
-    /*//////////////////////////////////////////////////////////////
-          EVENTS — SUPPLEMENT TO IBlieverUmaAdapter INTERFACE
-    //////////////////////////////////////////////////////////////
-      These events are defined here rather than in IBlieverUmaAdapter
-      because they were introduced after the initial interface cut.
-      IBlieverUmaAdapter.sol should be updated to include them so
-      external ABI consumers (SDKs, subgraphs) see a complete ABI.
-    //////////////////////////////////////////////////////////////*/
-
     // ── Implementation-only error ────────────────────────────────────────────
     /// @dev Reverts when _tryResetQuestion is called by any address other than
     ///      the adapter itself. This function is external only to satisfy
     ///      Solidity's try/catch requirement (which only works on external calls).
     ///      No external caller should ever invoke it directly.
     error BlieverUmaAdapter__OnlySelf();
-
-    /// @notice Emitted in priceDisputed when a second dispute escalates the question
-    ///         to full UMA DVM arbitration (48–96-hour token-holder vote).
-    ///         Indexers and monitoring bots must listen for this event to detect DVM
-    ///         escalation, since no other on-chain signal marks this state transition.
-    event QuestionEscalatedToDVM(bytes32 indexed questionId);
-
-    /// @notice Emitted when a best-effort reward refund fails (e.g. creator is
-    ///         USDC-blacklisted). Market settlement is unaffected — the market is
-    ///         already resolved by the time this fires.
-    ///         `amount` is the number of `token` units stranded on the adapter.
-    ///         An admin can recover them via a future upgrade or emergency function.
-    event RefundFailed(
-        bytes32 indexed questionId,
-        address indexed creator,
-        uint256         amount,
-        address indexed token
-    );
 
     /*//////////////////////////////////////////////////////////////
                             CONSTANTS
@@ -632,7 +605,7 @@ contract BlieverUmaAdapter is
             _bestEffortRefund(questionId, qd);
         }
 
-        emit QuestionManuallyResolved(questionId, winningOutcome);
+        emit QuestionManuallyResolved(questionId, winningOutcome, msg.sender);
     }
 
     /// @notice Admin failsafe: manually reset a question and issue a fresh OO request.
