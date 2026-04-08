@@ -84,9 +84,12 @@ interface IBlieverUmaAdapter {
     );
 
     /// @notice Emitted when a question is manually resolved by the EMERGENCY_ROLE.
+    ///         `resolver` is the msg.sender (EMERGENCY_ROLE holder) that executed the call,
+    ///         providing an immutable on-chain audit trail of which admin wallet acted.
     event QuestionManuallyResolved(
         bytes32 indexed questionId,
-        uint8           winningOutcome
+        uint8           winningOutcome,
+        address indexed resolver
     );
 
     /// @notice Emitted when the oracle returns type(int256).max (canceled / unresolvable event).
@@ -107,6 +110,24 @@ interface IBlieverUmaAdapter {
 
     /// @notice Emitted when an admin unpauses resolution for a single question.
     event QuestionUnpaused(bytes32 indexed questionId);
+
+    /// @notice Emitted in priceDisputed when a second dispute escalates the question
+    ///         to full UMA DVM arbitration (48–96-hour token-holder vote).
+    ///         Indexers and monitoring bots must listen for this event to detect DVM
+    ///         escalation, since no other on-chain signal marks this state transition.
+    event QuestionEscalatedToDVM(bytes32 indexed questionId);
+
+    /// @notice Emitted when a best-effort reward refund fails (e.g. creator is
+    ///         USDC-blacklisted). Market settlement is unaffected — the market is
+    ///         already resolved by the time this fires.
+    ///         `amount` is the number of `token` units stranded on the adapter.
+    ///         An admin can recover them via a future upgrade or emergency rescue function.
+    event RefundFailed(
+        bytes32 indexed questionId,
+        address indexed creator,
+        uint256         amount,
+        address indexed token
+    );
 
     /// @notice Emitted when the optimistic oracle address is updated.
     event OptimisticOracleUpdated(address indexed oldOracle, address indexed newOracle);
