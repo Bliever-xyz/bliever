@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copy from https://github.com/Polymarket/uma-ctf-adapter/blob/main/src/libraries/AncillaryDataLib.sol
 pragma solidity ^0.8.15;
 
 library AncillaryDataLib {
