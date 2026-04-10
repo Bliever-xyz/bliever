@@ -153,7 +153,7 @@ contract Integration_PoolConstraints is IntegrationBase {
         uint256 free   = pool.availableLiquidity();
         uint256 maxWd  = pool.maxWithdraw(lp);
 
-        assertLe(maxWd,  free,       "maxWithdraw ≤ availableLiquidity");
+        assertLe(maxWd, free, unicode"maxWithdraw <= availableLiquidity");
         assertLt(maxWd,  LP_DEPOSIT, "cannot withdraw full deposit while market active");
         assertGt(free,   0,          "some liquidity is free");
 
@@ -218,7 +218,7 @@ contract Integration_PoolConstraints is IntegrationBase {
         uint256 liabAfterTrades = pool.getMarketInfo(address(m)).currentLiability;
 
         // Liability is always capped at riskBudget.
-        assertLe(liabAfterTrades, MAX_RISK, "liability ≤ riskBudget after trades");
+        assertLe(liabAfterTrades, MAX_RISK, "liability <= riskBudget after trades");
 
         // Pool remains solvent.
         _assertPoolSolvent();
