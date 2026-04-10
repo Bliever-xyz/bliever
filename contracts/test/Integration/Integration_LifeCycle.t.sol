@@ -290,7 +290,7 @@ contract Integration_LifeCycle is IntegrationBase {
 
         // Verify CSS translation amount via view function.
         uint256 tBar = market7.getCssTranslation(alice, 0, 10e18);
-        assertEq(tBar, 5e18, "tBar = shareAmount − traderBal = 5e18");
+        assertEq(tBar, 5e18, unicode"tBar = shareAmount − traderBal = 5e18");
 
         // CSS sell: Alice sells 10e18 of outcome 0 (holds only 5e18 → CSS fires).
         _sell(market7, alice, 0, 10e18);
@@ -361,7 +361,7 @@ contract Integration_LifeCycle is IntegrationBase {
           LIABILITY TRACKING — VERIFY POOL ACCOUNTING ON TRADES
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice currentLiability in the pool's MarketInfo decreases (or stays ≤ riskBudget)
+    /// @notice currentLiability in the pool's MarketInfo decreases (or stays <= riskBudget)
     ///         as trading volume grows, reflecting the LS-LMSR Prop 4.9 bound.
     function test_binary_liabilityBounded_afterMultipleBuys() public {
         BlieverV1Pool.MarketInfo memory infoAtStart =
@@ -380,11 +380,11 @@ contract Integration_LifeCycle is IntegrationBase {
         BlieverV1Pool.MarketInfo memory infoAfterTrades =
             pool.getMarketInfo(address(market2));
 
-        // Belt-and-suspenders cap guarantees currentLiability ≤ riskBudget always.
+        // Belt-and-suspenders cap guarantees currentLiability <= riskBudget always.
         assertLe(
             infoAfterTrades.currentLiability,
             infoAfterTrades.riskBudget,
-            "currentLiability ≤ riskBudget after buys"
+            "currentLiability <= riskBudget after buys"
         );
         _assertPoolSolvent();
     }
