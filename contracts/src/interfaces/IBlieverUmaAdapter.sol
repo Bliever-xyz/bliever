@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.31;
 
+import {IOptimisticOracleV2} from "./IOptimisticOracleV2.sol";
 // ── Struct ──────────────────────────────────────────────────────────────────
 
 /// @notice Complete state for a registered oracle question.
@@ -235,5 +236,5 @@ interface IBlieverUmaAdapter {
     function isFlagged(bytes32 questionId) external view returns (bool);
 
     /// @notice The ManagedOptimisticOracleV2 address used for all price requests.
-    function optimisticOracle() external view returns (address);
+    function optimisticOracle() external view returns (IOptimisticOracleV2);
 }
