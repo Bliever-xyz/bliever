@@ -1,30 +1,32 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.31;
 
-import {Clones}       from "@openzeppelin/contracts/proxy/Clones.sol";
-import {ERC1967Proxy}  from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {IntegrationBase} from "./IntegrationBase.t.sol";
+import {BlieverV1Pool}   from "../../src/BlieverV1Pool.sol";
+import {BlieverMarket}   from "../../src/BlieverMarket.sol";
 
-import {IntegrationBase, IntegrationUSDC} from "./IntegrationBase.t.sol";
-import {BlieverV1Pool}  from "../../src/BlieverV1Pool.sol";
-import {BlieverMarket}  from "../../src/BlieverMarket.sol";
-
-/// @title  Integration_PoolConstraints
-/// @notice Integration tests targeting BlieverV1Pool's capacity rules, LP withdrawal
-///         constraints, pause/unpause behavior, and emergency administration paths,
-///         all verified through the real BlieverMarket contract.
+/// @title  Integration_MultiMarket
+/// @notice Integration tests covering concurrent operation of multiple markets
+///         within the same BlieverV1Pool vault.
 ///
 ///         Focus areas
 ///         ───────────
-///         • registerMarket reverts when vault assets are insufficient for the risk budget.
-///         • LP maxWithdraw is capped by the reserve buffer + active liability.
-///         • LP free liquidity grows as trading volume lowers worst-case loss bounds.
-///         • Pause blocks collectTradeCost/distributeRefund but NOT settleMarket or claimWinnings.
-///         • deregisterMarket (no-trades path) restores totalLiability correctly.
-///         • forceSettleMarket releases liability; no claims possible after force-settle.
-///         • LP can fully withdraw available liquidity once all markets have settled.
+///         • Pool accounting (totalLiability, activeMarketCount) stays accurate
+///           while trades happen across multiple live markets simultaneously.
+///         • Trading on market A does not corrupt market B's MarketInfo.
+///         • LP free liquidity and NAV reflect all active markets correctly.
+///         • Pool solvency invariant holds throughout any sequence of interleaved
+///           trade, settle, and claim calls across markets.
 ///
-/// @dev    Run: forge test --match-contract Integration_PoolConstraints --evm-version cancun -vvv
-contract Integration_PoolConstraints is IntegrationBase {
+/// @dev    Run: forge test --match-contract Integration_MultiMarket --evm-version cancun -vvv
+contract Integration_MultiMarket is IntegrationBase {
+
+    /*//////////////////////////////////////////////////////////////
+                              STATE
+    //////////////////////////////////////////////////////////////*/
+
+    BlieverMarket internal marketA; // 2-outcome binary market
+    BlieverMarket internal marketB; // 7-outcome multi-outcome market
 
     /*//////////////////////////////////////////////////////////////
                               SETUP
@@ -32,379 +34,258 @@ contract Integration_PoolConstraints is IntegrationBase {
 
     function setUp() public override {
         super.setUp();
+        marketA = _deployMarket(2, EPSILON_2);
+        marketB = _deployMarket(7, EPSILON_7);
+
         _setupTrader(alice);
         _setupTrader(bob);
+        _setupTrader(carol);
     }
 
     /*//////////////////////////////////////////////////////////////
-               CAPACITY CHECK — REGISTRATION REVERTS
+                 POOL ACCOUNTING — TWO ACTIVE MARKETS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice registerMarket reverts with CapacityExceeded when the vault does not
-    ///         have sufficient active capital to absorb another MAX_RISK allocation.
-    ///         A deposit of 624 USDC with 20% reserve means activeCap = 499.2e6
-    ///         which is < MAX_RISK = 500e6 → revert.
-    function test_registerMarket_reverts_CapacityExceeded_insufficientAssets() public {
-        // ── Deploy a separate underfunded pool ────────────────────────────────
-        BlieverV1Pool underImpl = new BlieverV1Pool();
-        ERC1967Proxy  proxy     = new ERC1967Proxy(
-            address(underImpl),
-            abi.encodeCall(
-                BlieverV1Pool.initialize,
-                (address(usdc), admin, ALPHA, MAX_RISK, RESERVE_BPS)
-            )
-        );
-        BlieverV1Pool underPool = BlieverV1Pool(address(proxy));
-        vm.label(address(underPool), "UnderFundedPool");
-
-        // Deposit exactly 624 USDC → activeCap = 624e6 × 0.8 = 499.2e6 < 500e6.
-        address smallLp = makeAddr("smallLp");
-        usdc.mint(smallLp, 624e6);
-        vm.startPrank(smallLp);
-        usdc.approve(address(underPool), 624e6);
-        underPool.deposit(624e6, smallLp);
-        vm.stopPrank();
-
-        // Deploy and initialise a market clone pointing to underPool.
-        address clone = Clones.clone(address(marketImpl));
-        BlieverMarket m = BlieverMarket(clone);
-        m.initialize(
-            address(underPool),
-            keccak256("cap-test"),
-            2,
-            ALPHA,
-            tradingDeadline,
-            resolutionDeadline,
-            EPSILON_2,
-            resolver,
-            address(this)
-        );
-
-        // registerMarket must revert with CapacityExceeded.
-        vm.prank(admin);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                BlieverV1Pool.CapacityExceeded.selector,
-                MAX_RISK,            // projected newTotalLiab (no existing markets)
-                underPool.totalAssets() * (10_000 - RESERVE_BPS) / 10_000
-            )
-        );
-        underPool.registerMarket(address(m), 2);
-    }
-
-    /// @notice Adding enough LP funds to cover activeCap threshold allows registration.
-    function test_registerMarket_succeedsAfterSufficientDeposit() public {
-        // Deploy a fresh pool with zero deposits.
-        BlieverV1Pool freshImpl = new BlieverV1Pool();
-        ERC1967Proxy  proxy     = new ERC1967Proxy(
-            address(freshImpl),
-            abi.encodeCall(
-                BlieverV1Pool.initialize,
-                (address(usdc), admin, ALPHA, MAX_RISK, RESERVE_BPS)
-            )
-        );
-        BlieverV1Pool freshPool = BlieverV1Pool(address(proxy));
-
-        // Fund pool with enough: need assets × 0.8 ≥ 500e6 → assets ≥ 625e6.
-        address fundedLp = makeAddr("fundedLp");
-        usdc.mint(fundedLp, 1_000e6);
-        vm.startPrank(fundedLp);
-        usdc.approve(address(freshPool), 1_000e6);
-        freshPool.deposit(1_000e6, fundedLp);
-        vm.stopPrank();
-
-        // Deploy and initialise a market pointing to freshPool.
-        address clone = Clones.clone(address(marketImpl));
-        BlieverMarket m = BlieverMarket(clone);
-        m.initialize(
-            address(freshPool),
-            keccak256("fresh-market"),
-            2,
-            ALPHA,
-            tradingDeadline,
-            resolutionDeadline,
-            EPSILON_2,
-            resolver,
-            address(this)
-        );
-
-        // Registration must succeed.
-        vm.prank(admin);
-        freshPool.registerMarket(address(m), 2); // no revert
-
-        assertEq(freshPool.activeMarketCount(), 1, "one market registered");
-        assertEq(freshPool.totalLiability(), MAX_RISK, "liability = MAX_RISK");
-    }
-
-    /*//////////////////////////////////////////////////////////////
-               LP WITHDRAWAL — CAPPED BY ACTIVE LIABILITY
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice LP's maxWithdraw is limited to free liquidity while a market is active.
-    ///         Free liquidity = assets − totalLiability − reserve buffer.
-    ///         LP cannot withdraw the full deposit when riskBudget is locked.
-    function test_lpWithdrawal_cappedByActiveMarketLiability() public {
-        BlieverMarket m = _deployMarket(2, EPSILON_2);
-
-        // activeCap = 50000e6 × 80% = 40000e6
-        // totalLiability after one market: 500e6
-        // reserve = 50000e6 × 20% = 10000e6
-        // free = 50000e6 − 500e6 − 10000e6 = 39500e6
-        uint256 free   = pool.availableLiquidity();
-        uint256 maxWd  = pool.maxWithdraw(lp);
-
-        assertLe(maxWd, free, unicode"maxWithdraw <= availableLiquidity");
-        assertLt(maxWd,  LP_DEPOSIT, "cannot withdraw full deposit while market active");
-        assertGt(free,   0,          "some liquidity is free");
-
-        // Settle the market; free liquidity must increase.
-        _resolve(m, 0);
-
-        uint256 freeAfter = pool.availableLiquidity();
-        assertGt(freeAfter, free, "free liquidity increased after market settles");
-    }
-
-    /// @notice LP can withdraw up to maxWithdraw while a market is active (partial withdraw).
-    function test_lp_partialWithdrawal_succeedsWhileMarketActive() public {
-        _deployMarket(2, EPSILON_2);
-
-        uint256 maxWd = pool.maxWithdraw(lp);
-        assertGt(maxWd, 0, "partial withdrawal should be possible");
-
-        uint256 lpUsdcBefore = usdc.balanceOf(lp);
-        vm.prank(lp);
-        pool.withdraw(maxWd, lp, lp);
-
-        assertEq(usdc.balanceOf(lp), lpUsdcBefore + maxWd, "LP received maxWd USDC");
+    /// @notice On registration, each market adds exactly MAX_RISK to totalLiability
+    ///         and increments activeMarketCount by 1.
+    function test_twoMarkets_poolAccountingOnRegistration() public {
+        assertEq(pool.activeMarketCount(), 2,           "two markets registered");
+        assertEq(pool.totalLiability(), 2 * MAX_RISK, unicode"totalLiability = 2 × MAX_RISK");
+        assertTrue(pool.isActiveMarket(address(marketA)), "market A active");
+        assertTrue(pool.isActiveMarket(address(marketB)), "market B active");
         _assertPoolSolvent();
     }
 
-    /// @notice LP's maxWithdraw reaches maximum (bounded only by reserve) after all markets settle.
-    function test_lp_maxWithdraw_isMaxAfterAllMarketsSettle() public {
-        BlieverMarket m = _deployMarket(2, EPSILON_2);
-        _resolve(m, 0);
+    /// @notice Trades on market A update market A's MarketInfo fields but leave
+    ///         market B's MarketInfo completely unchanged (isolated accounting).
+    function test_twoMarkets_tradeOnA_doesNotAffectBMarketInfo() public {
+        BlieverV1Pool.MarketInfo memory bBefore =
+            pool.getMarketInfo(address(marketB));
 
-        // After settlement totalLiability = 0.
-        // free = assets − 0 − reserve = assets × (1 − reserveBps/BPS_BASE)
-        // maxWithdraw(lp) = min(lpOwnerAssets, free)
-        uint256 maxWd = pool.maxWithdraw(lp);
-        assertGt(maxWd, 0, "LP can withdraw after all markets settle");
+        // Trade on A only.
+        _buy(marketA, alice, 0, 20e18);
+        _buy(marketA, bob,   1, 20e18);
 
-        uint256 lpUsdcBefore = usdc.balanceOf(lp);
-        vm.prank(lp);
-        pool.withdraw(maxWd, lp, lp);
+        BlieverV1Pool.MarketInfo memory bAfter =
+            pool.getMarketInfo(address(marketB));
 
-        assertEq(usdc.balanceOf(lp), lpUsdcBefore + maxWd, "LP received correct USDC");
+        // Market B's accounting is completely isolated.
+        assertEq(bAfter.currentLiability, bBefore.currentLiability,
+            "market B currentLiability unchanged");
+        assertEq(bAfter.riskBudget,       bBefore.riskBudget,
+            "market B riskBudget unchanged");
+        assertEq(bAfter.hasTrades,        bBefore.hasTrades,
+            "market B hasTrades flag unchanged");
+        _assertPoolSolvent();
+    }
+
+    /// @notice totalLiability is the correct sum of both markets' currentLiabilities.
+    ///         After trading on both markets, the pool's single totalLiability value
+    ///         equals the sum of the two per-market values.
+    function test_twoMarkets_totalLiabilityEqualsSum() public {
+        _buy(marketA, alice, 0, 15e18);
+        _buy(marketB, bob,   2, 15e18);
+        _buy(marketB, carol, 5, 15e18);
+
+        BlieverV1Pool.MarketInfo memory aInfo =
+            pool.getMarketInfo(address(marketA));
+        BlieverV1Pool.MarketInfo memory bInfo =
+            pool.getMarketInfo(address(marketB));
+
+        uint256 expectedTotal = aInfo.currentLiability + bInfo.currentLiability;
+        assertEq(
+            pool.totalLiability(), expectedTotal,
+            "totalLiability == sum of per-market currentLiabilities"
+        );
         _assertPoolSolvent();
     }
 
     /*//////////////////////////////////////////////////////////////
-               LP FREE LIQUIDITY GROWS WITH TRADING VOLUME
+             SEQUENTIAL SETTLEMENT — ACCOUNTING CORRECTNESS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice As trading volume grows, the LS-LMSR worst-case loss bound decreases,
-    ///         which reduces currentLiability, which expands LP free liquidity.
-    function test_lpFreeLiquidity_mayIncreaseAsVolumeGrows() public {
-        BlieverMarket m = _deployMarket(2, EPSILON_2);
+    /// @notice Settle market A while market B is still active.
+    ///         Verifies: activeMarketCount goes to 1, totalLiability decreases
+    ///         by A's currentLiability, and market B remains fully tradeable.
+    function test_twoMarkets_settleA_keepsBActive() public {
+        _buy(marketA, alice, 0, 10e18);
+        _buy(marketB, bob,   3, 10e18);
 
-        // After registration: currentLiability = riskBudget = MAX_RISK (most conservative).
-        uint256 liabAtStart = pool.getMarketInfo(address(m)).currentLiability;
-        assertEq(liabAtStart, MAX_RISK, "initial currentLiability == MAX_RISK");
+        uint256 aLiabBeforeSettle =
+            pool.getMarketInfo(address(marketA)).currentLiability;
+        uint256 totalLiabBeforeSettle = pool.totalLiability();
 
-        // Buy volume across both outcomes (symmetric volume reduces worst-case loss).
-        _buy(m, alice, 0, 50e18);
-        _buy(m, bob,   1, 50e18);
+        // Settle A.
+        _resolve(marketA, 0);
 
-        uint256 liabAfterTrades = pool.getMarketInfo(address(m)).currentLiability;
+        assertEq(pool.activeMarketCount(), 1, "only B remains active");
+        assertFalse(pool.isActiveMarket(address(marketA)), "A no longer active");
+        assertTrue(pool.isActiveMarket(address(marketB)),  "B still active");
+        assertEq(
+            pool.totalLiability(),
+            totalLiabBeforeSettle - aLiabBeforeSettle,
+            "totalLiability reduced by A's live liability at settle"
+        );
 
-        // Liability is always capped at riskBudget.
-        assertLe(liabAfterTrades, MAX_RISK, "liability <= riskBudget after trades");
+        // Claims on A still work normally after B is active.
+        _claim(marketA, alice);
 
-        // Pool remains solvent.
+        // Market B is still tradeable.
+        _buy(marketB, carol, 1, 5e18);
         _assertPoolSolvent();
     }
 
-    /*//////////////////////////////////////////////////////////////
-               PAUSE — BLOCKS TRADING, NOT SETTLEMENT
-    //////////////////////////////////////////////////////////////*/
+    /// @notice Settle both markets sequentially; after both are done:
+    ///         totalLiability == 0 and activeMarketCount == 0.
+    function test_twoMarkets_sequentialFullLifecycle_poolCleanAfter() public {
+        // Trades on A.
+        _buy(marketA, alice, 0, 10e18);
+        _buy(marketA, bob,   1, 5e18);
 
-    /// @notice Pausing the vault blocks buy/sell trades (collectTradeCost/distributeRefund
-    ///         are whenNotPaused) but settleMarket and claimWinnings are NOT pause-gated.
-    function test_pause_blocksTrades_doesNotBlockSettlementOrClaim() public {
-        BlieverMarket m = _deployMarket(2, EPSILON_2);
-        _buy(m, alice, 0, 5e18);
+        // Trades on B.
+        _buy(marketB, carol, 3, 10e18);
 
-        // ── Pause the vault ───────────────────────────────────────────────────
-        vm.prank(admin);
-        pool.pause();
+        // Settle A (outcome 0); Alice claims, Bob cannot.
+        _resolve(marketA, 0);
+        _claim(marketA, alice);
 
-        // ── Buy fails: collectTradeCost is whenNotPaused ──────────────────────
         vm.prank(bob);
-        vm.expectRevert(); // OZ EnforcedPause propagated from pool
-        m.buy(0, 5e18, type(uint256).max, 0, 0, 0, 0);
+        vm.expectRevert(BlieverMarket.NoWinningShares.selector);
+        marketA.claim();
 
-        // ── Settlement is NOT blocked — settleMarket has no pause gate ────────
-        _resolve(m, 0); // must NOT revert
+        // Settle B (outcome 3); Carol claims.
+        _resolve(marketB, 3);
+        _claim(marketB, carol);
 
-        // ── Claim is NOT blocked — claimWinnings has no pause gate ────────────
-        _claim(m, alice); // must NOT revert
+        // ── Post-settlement assertions ────────────────────────────────────────
+        assertEq(pool.activeMarketCount(), 0, "no active markets remain");
+        assertEq(pool.totalLiability(),    0, "zero total liability after both settle");
+        assertFalse(pool.isActiveMarket(address(marketA)), "A inactive");
+        assertFalse(pool.isActiveMarket(address(marketB)), "B inactive");
         _assertPoolSolvent();
-
-        // ── Unpause (requires DEFAULT_ADMIN_ROLE) ─────────────────────────────
-        vm.prank(admin);
-        pool.unpause();
-
-        // Trading resumes on a new market.
-        BlieverMarket m2 = _deployMarket(2, EPSILON_2);
-        _buy(m2, bob, 0, 5e18); // must NOT revert
-        _assertPoolSolvent();
-    }
-
-    /// @notice Only PAUSER_ROLE can pause; only DEFAULT_ADMIN_ROLE can unpause.
-    ///         Unpause by a non-admin reverts.
-    function test_pause_roleEnforcement() public {
-        address attacker = makeAddr("attacker");
-
-        // Non-pauser cannot pause.
-        vm.prank(attacker);
-        vm.expectRevert(); // AccessControlUnauthorizedAccount
-        pool.pause();
-
-        // Admin (PAUSER_ROLE) can pause.
-        vm.prank(admin);
-        pool.pause();
-
-        // Non-admin cannot unpause.
-        vm.prank(attacker);
-        vm.expectRevert(); // AccessControlUnauthorizedAccount
-        pool.unpause();
-
-        // Admin (DEFAULT_ADMIN_ROLE) can unpause.
-        vm.prank(admin);
-        pool.unpause(); // no revert
     }
 
     /*//////////////////////////////////////////////////////////////
-               DEREGISTER MARKET (NO-TRADES PATH)
+             CONCURRENT SOLVENCY INVARIANT
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice deregisterMarket (before any trades) releases the riskBudget from
-    ///         totalLiability, decrements activeMarketCount, and revokes MARKET_ROLE.
-    function test_deregisterMarket_noTrades_restoresLiabilityAndCount() public {
-        BlieverMarket m = _deployMarket(2, EPSILON_2);
+    /// @notice Solvency holds at every step during heavily interleaved trading on
+    ///         both markets, including buys, sells, settles, and claims.
+    function test_twoMarkets_solvencyInvariant_throughoutConcurrentTrading() public {
+        // ── Interleaved trades ────────────────────────────────────────────────
+        _buy(marketA, alice, 0, 15e18);
+        _assertPoolSolvent();                                          // checkpoint S1
 
-        uint256 liabBefore  = pool.totalLiability();
-        uint256 countBefore = pool.activeMarketCount();
+        _buy(marketB, bob, 2, 20e18);
+        _assertPoolSolvent();                                          // S2
 
-        vm.prank(admin);
-        pool.deregisterMarket(address(m));
+        _sell(marketA, alice, 0, 7e18);
+        _assertPoolSolvent();                                          // S3
 
-        assertEq(pool.totalLiability(),    liabBefore - MAX_RISK, "riskBudget released");
-        assertEq(pool.activeMarketCount(), countBefore - 1,        "count decremented");
-        assertFalse(
-            pool.hasRole(pool.MARKET_ROLE(), address(m)),
-            "MARKET_ROLE revoked on deregister"
-        );
-        assertFalse(pool.getMarketInfo(address(m)).registered, "market info deleted");
-        _assertPoolSolvent();
-    }
+        _buy(marketB, carol, 5, 10e18);
+        _assertPoolSolvent();                                          // S4
 
-    /// @notice deregisterMarket reverts with MarketHasTrades once a trade has been executed.
-    ///         This prevents deregistering a market that has live trader positions.
-    function test_deregisterMarket_reverts_MarketHasTrades() public {
-        BlieverMarket m = _deployMarket(2, EPSILON_2);
-        _buy(m, alice, 0, 5e18);
+        _buy(marketA, bob, 1, 5e18);
+        _assertPoolSolvent();                                          // S5
 
-        vm.prank(admin);
-        vm.expectRevert(BlieverV1Pool.MarketHasTrades.selector);
-        pool.deregisterMarket(address(m));
+        // ── Settle A while B is still live ────────────────────────────────────
+        _resolve(marketA, 0);
+        _assertPoolSolvent();                                          // S6
+
+        _claim(marketA, alice);   // Alice still has shares (8e18 remaining after partial sell)
+        _assertPoolSolvent();                                          // S7
+
+        // ── More trading on B ─────────────────────────────────────────────────
+        _buy(marketB, alice, 3, 5e18);
+        _assertPoolSolvent();                                          // S8
+
+        // ── Settle B ─────────────────────────────────────────────────────────
+        _resolve(marketB, 2);
+        _assertPoolSolvent();                                          // S9
+
+        _claim(marketB, bob);
+        _assertPoolSolvent();                                          // S10
+
+        // Final state: pool holds LP capital + net spread; fully solvent.
+        assertEq(pool.activeMarketCount(), 0, "all markets settled");
+        assertEq(pool.totalLiability(),    0, "zero liability at end");
     }
 
     /*//////////////////////////////////////////////////////////////
-               FORCE SETTLE — EMERGENCY PATH
+             LP WITHDRAWAL INTERACTION WITH TWO MARKETS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice forceSettleMarket (EMERGENCY_ROLE) marks the market settled,
-    ///         zeros all payout fields, releases currentLiability from totalLiability,
-    ///         and revokes MARKET_ROLE.  No USDC is transferred — vault absorbs the loss.
-    function test_forceSettle_releasesLiability_revokesMARKET_ROLE() public {
-        BlieverMarket m = _deployMarket(2, EPSILON_2);
-        _buy(m, alice, 0, 10e18);
+    /// @notice LP's maxWithdraw increases as markets settle because each settlement
+    ///         releases riskBudget from totalLiability, expanding free liquidity.
+    function test_twoMarkets_lpWithdrawal_increasesAsMarketsSettle() public {
+        uint256 freeWhileBothActive = pool.availableLiquidity();
+        uint256 lpMaxWhileBothActive = pool.maxWithdraw(lp);
 
-        uint256 mLiab      = pool.getMarketInfo(address(m)).currentLiability;
-        uint256 liabBefore = pool.totalLiability();
-        uint256 countBefore = pool.activeMarketCount();
+        // Settle A (no trades — zero payout, full riskBudget freed).
+        _resolve(marketA, 0);
 
-        vm.prank(admin); // admin holds EMERGENCY_ROLE
-        pool.forceSettleMarket(address(m));
+        uint256 freeAfterA = pool.availableLiquidity();
+        uint256 lpMaxAfterA = pool.maxWithdraw(lp);
 
-        BlieverV1Pool.MarketInfo memory info = pool.getMarketInfo(address(m));
-        assertTrue(info.settled,          "force-settled flag set");
-        assertEq(info.settledPayout, 0,   "settledPayout = 0");
-        assertEq(info.riskBudget, 0,      "riskBudget zeroed");
-        assertEq(info.currentLiability, 0,"currentLiability zeroed");
+        assertGt(freeAfterA,   freeWhileBothActive, "free liquidity increased after A settles");
+        assertGt(lpMaxAfterA,  lpMaxWhileBothActive, "LP maxWithdraw increased after A settles");
 
-        assertEq(pool.totalLiability(),    liabBefore - mLiab, "liability released");
-        assertEq(pool.activeMarketCount(), countBefore - 1,    "count decremented");
-        assertFalse(
-            pool.hasRole(pool.MARKET_ROLE(), address(m)),
-            "MARKET_ROLE revoked"
-        );
+        // Settle B (no trades — zero payout, full riskBudget freed).
+        _resolve(marketB, 0);
+
+        uint256 freeAfterBoth = pool.availableLiquidity();
+        uint256 lpMaxAfterBoth = pool.maxWithdraw(lp);
+
+        assertGt(freeAfterBoth, freeAfterA,  "free liquidity increased after B settles");
+        assertGt(lpMaxAfterBoth, lpMaxAfterA, "LP maxWithdraw increased after B settles");
         _assertPoolSolvent();
     }
 
-    /// @notice After forceSettleMarket, market.claim() reverts because market.resolved
-    ///         was never set to true by the market contract (forceSettle is a pool-only
-    ///         operation — it does not call back into the market contract).
-    function test_forceSettle_marketClaimReverts_MarketNotResolved() public {
-        BlieverMarket m = _deployMarket(2, EPSILON_2);
-        _buy(m, alice, 0, 10e18);
+    /// @notice LP cannot withdraw more than availableLiquidity while both markets
+    ///         are active (totalLiability + reserve floor constrain the withdrawal).
+    function test_twoMarkets_lpWithdrawal_cappedWhileMarketsActive() public {
+        uint256 free     = pool.availableLiquidity();
+        uint256 maxWd    = pool.maxWithdraw(lp);
 
-        vm.prank(admin);
-        pool.forceSettleMarket(address(m));
+        // LP cannot withdraw more than the free liquidity ceiling.
+        assertLe(maxWd, free, "maxWithdraw <= availableLiquidity");
 
-        // market.resolved == false (never set by the market contract).
-        assertFalse(m.resolved(), "market.resolved == false after force-settle");
+        // LP cannot withdraw the full deposit while markets are active.
+        assertLt(maxWd, LP_DEPOSIT, "cannot withdraw full LP deposit while markets active");
 
-        // claim() checks !resolved first → MarketNotResolved.
-        vm.prank(alice);
-        vm.expectRevert(BlieverMarket.MarketNotResolved.selector);
-        m.claim();
-    }
-
-    /// @notice Only EMERGENCY_ROLE can call forceSettleMarket.
-    function test_forceSettle_revertsForNonEmergencyRole() public {
-        BlieverMarket m = _deployMarket(2, EPSILON_2);
-        address attacker = makeAddr("attacker");
-
-        vm.prank(attacker);
-        vm.expectRevert(); // AccessControlUnauthorizedAccount
-        pool.forceSettleMarket(address(m));
+        // Withdrawing exactly `maxWd` succeeds.
+        if (maxWd > 0) {
+            vm.prank(lp);
+            pool.withdraw(maxWd, lp, lp);
+            _assertPoolSolvent();
+        }
     }
 
     /*//////////////////////////////////////////////////////////////
-               SOLVENCY — SELL REFUND PATH
+             POOL NAV REFLECTS MARKET SPREAD INCOME
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice pool.distributeRefund checks _assertSolvent() after transferring USDC out.
-    ///         Verify the pool remains solvent after a large sell refund.
-    function test_sell_refund_poolRemainssolvent() public {
-        BlieverMarket m = _deployMarket(2, EPSILON_2);
+    /// @notice After trading on both markets, pool NAV (totalAssets − totalLiability)
+    ///         is strictly greater than the initial NAV because the vault earns spread.
+    ///         The vault's profit = Σ (riskBudget_i − settledPayout_i) ≥ 0 per market.
+    function test_twoMarkets_navIncreases_afterProfitableSettlement() public {
+        // NAV at start: LP_DEPOSIT − 2 × MAX_RISK (both markets' riskBudgets as liability).
+        uint256 navBefore = pool.nav();
 
-        // Large buy to create a significant position.
-        _buy(m, alice, 0, 100e18);
-        _buy(m, alice, 0, 100e18);
-        _buy(m, alice, 0, 100e18);
+        // Traders buy on both markets.
+        _buy(marketA, alice, 0, 5e18);
+        _buy(marketB, bob,   4, 5e18);
 
-        uint256 poolBalBeforeSell = usdc.balanceOf(address(pool));
+        // Settle both: Alice loses (outcome 1 wins), Bob loses (outcome 0 wins).
+        // Both traders' USDC stays in the vault → LP profit.
+        _resolve(marketA, 1); // Alice bought outcome 0 — loses
+        _resolve(marketB, 0); // Bob bought outcome 4 — loses
 
-        // Sell a large chunk back.
-        _sell(m, alice, 0, 150e18);
+        uint256 navAfter = pool.nav();
 
-        uint256 poolBalAfterSell = usdc.balanceOf(address(pool));
-        assertLt(poolBalAfterSell, poolBalBeforeSell, "pool paid refund on sell");
-
-        // Pool must remain solvent after the refund transfer.
+        // Both markets settled with zero payout (losers only) — vault absorbed the spread.
+        assertGt(navAfter, navBefore, "NAV increased after profitable settlement");
+        assertEq(pool.activeMarketCount(), 0, "all markets settled");
         _assertPoolSolvent();
     }
 }
