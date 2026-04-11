@@ -81,12 +81,13 @@ contract Integration_PoolConstraints is IntegrationBase {
         );
 
         // registerMarket must revert with CapacityExceeded.
+        uint256 activeCap = underPool.totalAssets() * (10_000 - RESERVE_BPS) / 10_000;
         vm.prank(admin);
         vm.expectRevert(
-            abi.encodeWithSelector(
+           abi.encodeWithSelector(
                 BlieverV1Pool.CapacityExceeded.selector,
-                MAX_RISK,            // projected newTotalLiab (no existing markets)
-                underPool.totalAssets() * (10_000 - RESERVE_BPS) / 10_000
+                MAX_RISK,
+                activeCap
             )
         );
         underPool.registerMarket(address(m), 2);
