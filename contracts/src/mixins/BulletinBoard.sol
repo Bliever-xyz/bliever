@@ -2,11 +2,6 @@
 // Copy from https://github.com/Polymarket/uma-ctf-adapter/blob/main/src/mixins/BulletinBoard.sol
 pragma solidity 0.8.31;
 
-import {IBulletinBoard, AncillaryDataUpdate} from "../interfaces/IBulletinBoard.sol";
-
-// SPDX-License-Identifier: MIT
-pragma solidity 0.8.15;
-
 import { IBulletinBoard, AncillaryDataUpdate } from "src/interfaces/IBulletinBoard.sol";
 
 /// @title Bulletin Board
