@@ -316,7 +316,9 @@ contract Integration_PoolConstraints is IntegrationBase {
         _buy(m, alice, 0, 5e18);
 
         vm.prank(admin);
-        vm.expectRevert(BlieverV1Pool.MarketHasTrades.selector);
+        vm.expectRevert(
+         abi.encodeWithSelector(BlieverV1Pool.MarketHasTrades.selector, address(m))
+        );
         pool.deregisterMarket(address(m));
     }
 
