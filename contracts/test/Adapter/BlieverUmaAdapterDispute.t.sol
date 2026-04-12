@@ -3,10 +3,10 @@ pragma solidity 0.8.31;
 
 import {console2} from "forge-std/Test.sol";
 
-import {BlieverUmaAdapter}      from "../../src/BlieverUmaAdapter.sol";
-import {QuestionData}            from "../../src/interfaces/IBlieverUmaAdapter.sol";
+import {BlieverUmaAdapter}                       from "../../src/BlieverUmaAdapter.sol";
+import {IBlieverUmaAdapter, QuestionData}         from "../../src/interfaces/IBlieverUmaAdapter.sol";
 
-import {BlieverUmaAdapterBase}   from "./BlieverMarket/BlieverUmaAdapterBase.t.sol";
+import {BlieverUmaAdapterBase}   from "./BlieverUmaAdapterBase.t.sol";
 import {MockOptimisticOracleV2}  from "../mocks/MockOptimisticOracleV2.sol";
 import {MockBlieverMarket}       from "../mocks/MockBlieverMarket.sol";
 
@@ -36,7 +36,7 @@ contract BlieverUmaAdapterDisputeTest is BlieverUmaAdapterBase {
         uint256 requestsBefore = mockOO.requestPriceCalls();
 
         vm.expectEmit(true, false, false, false, address(adapter));
-        emit BlieverUmaAdapter.QuestionReset(qId);
+        emit IBlieverUmaAdapter.QuestionReset(qId);
 
         _simulateDispute(qId);
 
@@ -87,7 +87,7 @@ contract BlieverUmaAdapterDisputeTest is BlieverUmaAdapterBase {
 
         // Second dispute → DVM escalation
         vm.expectEmit(true, false, false, false, address(adapter));
-        emit BlieverUmaAdapter.QuestionEscalatedToDVM(qId);
+        emit IBlieverUmaAdapter.QuestionEscalatedToDVM(qId);
 
         _simulateDispute(qId);
 
@@ -167,7 +167,7 @@ contract BlieverUmaAdapterDisputeTest is BlieverUmaAdapterBase {
         assertFalse(qdAfter.refund,  "refund flag should not be set on stale callback");
         assertEq(mockOO.requestPriceCalls(), requestsBefore, "new request issued on stale callback");
 
-        console2.log("Stale timestamp silently ignored — no state mutation");
+        console2.log("Stale timestamp silently ignored -- no state mutation");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -181,7 +181,7 @@ contract BlieverUmaAdapterDisputeTest is BlieverUmaAdapterBase {
         mockOO.setShouldRevert(true);
 
         vm.expectEmit(true, false, false, false, address(adapter));
-        emit BlieverUmaAdapter.QuestionFlagged(qId);
+        emit IBlieverUmaAdapter.QuestionFlagged(qId);
 
         _simulateDispute(qId);
 
