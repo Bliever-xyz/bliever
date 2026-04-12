@@ -3,10 +3,10 @@ pragma solidity 0.8.31;
 
 import {console2} from "forge-std/Test.sol";
 
-import {BlieverUmaAdapter}      from "../../src/BlieverUmaAdapter.sol";
-import {QuestionData}            from "../../src/interfaces/IBlieverUmaAdapter.sol";
-import {AncillaryDataLib}       from "../../src/libraries/AncillaryDataLib.sol";
-import {ERC1967Proxy}           from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {BlieverUmaAdapter}                       from "../../src/BlieverUmaAdapter.sol";
+import {IBlieverUmaAdapter, QuestionData}         from "../../src/interfaces/IBlieverUmaAdapter.sol";
+import {AncillaryDataLib}                         from "../../src/libraries/AncillaryDataLib.sol";
+import {ERC1967Proxy}                             from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 import {BlieverUmaAdapterBase, EncodeOutcome} from "./BlieverUmaAdapterBase.t.sol";
 import {MockOptimisticOracleV2}  from "../mocks/MockOptimisticOracleV2.sol";
@@ -142,7 +142,7 @@ contract BlieverUmaAdapterUnitTest is BlieverUmaAdapterBase {
         rewardToken.approve(address(adapter), type(uint256).max);
 
         vm.expectEmit(true, true, true, false, address(adapter));
-        emit BlieverUmaAdapter.QuestionInitialized(
+        emit IBlieverUmaAdapter.QuestionInitialized(
             expectedQId,
             uint256(block.timestamp),
             address(market2),
@@ -338,7 +338,7 @@ contract BlieverUmaAdapterUnitTest is BlieverUmaAdapterBase {
         mockOO.setPrice(encodedPrice);
 
         vm.expectEmit(true, false, false, true, address(adapter));
-        emit BlieverUmaAdapter.QuestionResolved(qId, encodedPrice, 0);
+        emit IBlieverUmaAdapter.QuestionResolved(qId, encodedPrice, 0);
 
         adapter.resolve(qId);
     }
@@ -397,7 +397,7 @@ contract BlieverUmaAdapterUnitTest is BlieverUmaAdapterBase {
         mockOO.setPrice(type(int256).min);
 
         vm.expectEmit(true, false, false, false, address(adapter));
-        emit BlieverUmaAdapter.QuestionFlagged(qId);
+        emit IBlieverUmaAdapter.QuestionFlagged(qId);
 
         adapter.resolve(qId);
 
@@ -416,7 +416,7 @@ contract BlieverUmaAdapterUnitTest is BlieverUmaAdapterBase {
         mockOO.setPrice(type(int256).max);
 
         vm.expectEmit(true, false, false, false, address(adapter));
-        emit BlieverUmaAdapter.QuestionUnresolvable(qId);
+        emit IBlieverUmaAdapter.QuestionUnresolvable(qId);
 
         adapter.resolve(qId);
 
@@ -492,7 +492,7 @@ contract BlieverUmaAdapterUnitTest is BlieverUmaAdapterBase {
         bytes32 qId = _initQuestion(market2, ANC_DATA_2);
 
         vm.expectEmit(true, false, false, false, address(adapter));
-        emit BlieverUmaAdapter.QuestionFlagged(qId);
+        emit IBlieverUmaAdapter.QuestionFlagged(qId);
 
         vm.prank(emergency);
         adapter.flag(qId);
@@ -541,7 +541,7 @@ contract BlieverUmaAdapterUnitTest is BlieverUmaAdapterBase {
         adapter.flag(qId);
 
         vm.expectEmit(true, false, false, false, address(adapter));
-        emit BlieverUmaAdapter.QuestionUnflagged(qId);
+        emit IBlieverUmaAdapter.QuestionUnflagged(qId);
 
         vm.prank(emergency);
         adapter.unflag(qId);
@@ -587,7 +587,7 @@ contract BlieverUmaAdapterUnitTest is BlieverUmaAdapterBase {
         _flagAndWait(qId);
 
         vm.expectEmit(true, false, true, false, address(adapter));
-        emit BlieverUmaAdapter.QuestionManuallyResolved(qId, 1, emergency);
+        emit IBlieverUmaAdapter.QuestionManuallyResolved(qId, 1, emergency);
 
         vm.prank(emergency);
         adapter.resolveManually(qId, 1);
@@ -688,7 +688,7 @@ contract BlieverUmaAdapterUnitTest is BlieverUmaAdapterBase {
     function test_pauseQuestion_emitsEvent() public {
         bytes32 qId = _initQuestion(market2, ANC_DATA_2);
         vm.expectEmit(true, false, false, false, address(adapter));
-        emit BlieverUmaAdapter.QuestionPaused(qId);
+        emit IBlieverUmaAdapter.QuestionPaused(qId);
         vm.prank(emergency);
         adapter.pauseQuestion(qId);
     }
@@ -697,7 +697,7 @@ contract BlieverUmaAdapterUnitTest is BlieverUmaAdapterBase {
         bytes32 qId = _initQuestion(market2, ANC_DATA_2);
         vm.prank(emergency); adapter.pauseQuestion(qId);
         vm.expectEmit(true, false, false, false, address(adapter));
-        emit BlieverUmaAdapter.QuestionUnpaused(qId);
+        emit IBlieverUmaAdapter.QuestionUnpaused(qId);
         vm.prank(emergency); adapter.unpauseQuestion(qId);
     }
 
@@ -771,7 +771,7 @@ contract BlieverUmaAdapterUnitTest is BlieverUmaAdapterBase {
         MockOptimisticOracleV2 newMockOO = new MockOptimisticOracleV2();
 
         vm.expectEmit(true, true, false, false, address(adapter));
-        emit BlieverUmaAdapter.OptimisticOracleUpdated(oldOracle, address(newMockOO));
+        emit IBlieverUmaAdapter.OptimisticOracleUpdated(oldOracle, address(newMockOO));
 
         vm.prank(admin);
         adapter.updateOptimisticOracle(address(newMockOO));
