@@ -378,6 +378,11 @@ contract BlieverUmaAdapterUnitTest is BlieverUmaAdapterBase {
         mockOO.setPrice(type(int256).min);
         uint256 requestsBefore = mockOO.requestPriceCalls();
 
+        // Advance time by 1 second so _resetQuestion produces a strictly greater
+        // requestTimestamp.  Without this, block.timestamp == qd.requestTimestamp
+        // == 1 throughout the test and assertGt(1, 1) fails.
+        vm.warp(block.timestamp + 1);
+
         adapter.resolve(qId);
 
         // Must NOT be resolved; a new OO request must have been issued
