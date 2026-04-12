@@ -196,9 +196,10 @@ abstract contract BlieverUmaAdapterBase is Test {
     ///      Uses the current question's ancillaryData from the adapter storage.
     function _simulateDispute(bytes32 questionId) internal {
         QuestionData memory qd = adapter.getQuestion(questionId);
+        bytes32 identifier        = adapter.MULTIPLE_VALUES_IDENTIFIER();
         vm.prank(address(mockOO));
         adapter.priceDisputed(
-            adapter.MULTIPLE_VALUES_IDENTIFIER(),
+            identifier,
             qd.requestTimestamp,
             qd.ancillaryData,
             0
