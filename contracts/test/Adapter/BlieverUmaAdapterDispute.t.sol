@@ -127,12 +127,13 @@ contract BlieverUmaAdapterDisputeTest is BlieverUmaAdapterBase {
         uint256 factoryBefore = rewardToken.balanceOf(factory);
 
         // This should NOT revert — the adapter must be resilient to stale OO callbacks.
-        vm.prank(address(mockOO));
-        adapter.priceDisputed(
-            adapter.MULTIPLE_VALUES_IDENTIFIER(),
-            qdBefore.requestTimestamp, // matching timestamp = early reward path
-            qdBefore.ancillaryData,
-            0
+       bytes32 identifier = adapter.MULTIPLE_VALUES_IDENTIFIER();
+       vm.prank(address(mockOO));
+       adapter.priceDisputed(
+         identifier,
+         qdBefore.requestTimestamp,
+         qdBefore.ancillaryData,
+          0
         );
 
         // State must not have changed (already resolved)
@@ -151,10 +152,11 @@ contract BlieverUmaAdapterDisputeTest is BlieverUmaAdapterBase {
 
         // Use a WRONG timestamp (not the current requestTimestamp)
         uint256 staleTimestamp = qdBefore.requestTimestamp - 1;
-
+        
+        bytes32 identifier = adapter.MULTIPLE_VALUES_IDENTIFIER();
         vm.prank(address(mockOO));
         adapter.priceDisputed(
-            adapter.MULTIPLE_VALUES_IDENTIFIER(),
+            identifier,
             staleTimestamp,
             qdBefore.ancillaryData,
             0
@@ -234,10 +236,11 @@ contract BlieverUmaAdapterDisputeTest is BlieverUmaAdapterBase {
         QuestionData memory qd = adapter.getQuestion(qId);
 
         // Call from attacker — not a known oracle
+        bytes32 identifier = adapter.MULTIPLE_VALUES_IDENTIFIER();
         vm.prank(attacker);
         vm.expectRevert(abi.encodeWithSignature("NotOptimisticOracle()"));
         adapter.priceDisputed(
-            adapter.MULTIPLE_VALUES_IDENTIFIER(),
+            identifier,
             qd.requestTimestamp,
             qd.ancillaryData,
             0
@@ -324,10 +327,11 @@ contract BlieverUmaAdapterDisputeTest is BlieverUmaAdapterBase {
 
         // Ensure badTimestamp doesn't equal the real requestTimestamp
         vm.assume(badTimestamp != qd.requestTimestamp);
-
+        
+        bytes32 identifier = adapter.MULTIPLE_VALUES_IDENTIFIER();
         vm.prank(address(mockOO));
         adapter.priceDisputed(
-            adapter.MULTIPLE_VALUES_IDENTIFIER(),
+            identifier,
             badTimestamp,
             qd.ancillaryData,
             0
