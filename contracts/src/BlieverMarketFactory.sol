@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.31;
 
-/**
- * @custom:security-contact security@bliever.xyz
- * @custom:audit-status      Unaudited — do NOT deploy to mainnet without a full audit.
- */
-
 /*//////////////////////////////////////////////////////////////
                        OPENZEPPELIN — STANDARD
 //////////////////////////////////////////////////////////////*/
