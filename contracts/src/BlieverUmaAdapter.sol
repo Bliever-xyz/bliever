@@ -1057,8 +1057,10 @@ contract BlieverUmaAdapter is
     ///      can address the root cause (blacklist, token pause) before retrying.
     ///      Do NOT call this from settlement-critical paths; use _bestEffortRefund instead.
     function _refund(QuestionData storage qd) internal {
-        IERC20(qd.rewardToken).safeTransfer(qd.creator, qd.reward);
-    }
+    uint256 amount = qd.reward;
+    qd.reward      = 0;                                          // CEI: clear before external call
+    IERC20(qd.rewardToken).safeTransfer(qd.creator, amount);
+    } 
 
     /*//////////////////////////////////////////////////////////////
                     INTERNAL — PREDICATE HELPERS
