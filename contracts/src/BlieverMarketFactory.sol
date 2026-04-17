@@ -106,6 +106,11 @@ struct DeployParams {
     ///      If > 0, caller must approve THIS factory for this amount before calling deployMarket.
     uint256 reward;
 
+    // ── Deployment addressing ─────────────────────────────────────────────────
+    // The CREATE2 salt is derived automatically inside deployMarket as
+    // keccak256(abi.encode(questionId)).  Pre-compute the clone address with
+    // predictMarketAddress(questionId) before broadcasting the deployment tx.
+
     /// @dev Proposer / disputer bond in rewardToken decimals.
     ///      Enforced by the OO during the liveness window.
     uint256 bond;
@@ -114,11 +119,6 @@ struct DeployParams {
     ///      Minimum value is enforced by the UMA Optimistic Oracle.
     uint256 liveness;
 
-    // ── Deployment addressing ─────────────────────────────────────────────────
-    /// @dev CREATE2 salt that deterministically fixes the clone's address.
-    ///      Recommended derivation: keccak256(abi.encode(questionId)).
-    ///      Pre-compute the address with predictMarketAddress(salt) before broadcasting.
-    bytes32 salt;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -273,14 +273,12 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
     /// @param nOutcomes          Number of mutually exclusive outcomes.
     /// @param tradingDeadline    Unix timestamp at which trading closes.
     /// @param resolutionDeadline Unix timestamp by which oracle must resolve.
-    /// @param salt               CREATE2 salt used to derive the clone address.
     event MarketDeployed(
         address indexed market,
         bytes32 indexed questionId,
         uint8           nOutcomes,
         uint40          tradingDeadline,
-        uint40          resolutionDeadline,
-        bytes32         salt
+        uint40          resolutionDeadline
     );
 
     /// @notice Emitted when expireUnresolved successfully expires a timed-out market.
@@ -325,10 +323,13 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
     /// @dev questionId is bytes32(0) — not a valid oracle question identifier.
     error BlieverMarketFactory__InvalidQuestionId();
 
-    /// @dev The CREATE2 address for this salt already contains deployed bytecode.
-    /// @param salt     The colliding salt.
-    /// @param existing The address already occupied.
-    error BlieverMarketFactory__SaltAlreadyUsed(bytes32 salt, address existing);
+    /// @dev ancillaryData is empty — not a valid oracle question payload.
+    error BlieverMarketFactory__InvalidAncillaryData();
+
+    /// @dev A market for this questionId has already been deployed by this factory.
+    /// @param questionId The duplicate oracle question identifier.
+    /// @param existing   The address already occupied by the prior deployment.
+    error BlieverMarketFactory__QuestionAlreadyDeployed(bytes32 questionId, address existing);
 
     /// @dev computeEpsilon returned 0 — pool params may be misconfigured.
     error BlieverMarketFactory__ZeroEpsilon();
@@ -436,9 +437,11 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
     ///               full = ancillaryData ++ ",initializer:" ++ lowerCaseHex(factoryAddress)
     ///               questionId = keccak256(full)
     ///           The adapter validates this on-chain and reverts with QuestionIdMismatch if wrong.
-    ///         • params.salt should be unique — recommended: keccak256(abi.encode(questionId)).
-    ///           The factory pre-checks for address collision and reverts with SaltAlreadyUsed
-    ///           before any token movements or clone deployments occur.
+    ///         • The CREATE2 salt is derived automatically as keccak256(abi.encode(questionId)).
+    ///           Pre-compute the clone address with predictMarketAddress(questionId) before
+    ///           broadcasting. Each questionId maps to exactly one market address — a duplicate
+    ///           questionId reverts with QuestionAlreadyDeployed before any gas is spent on
+    ///           token transfers or clone deployment.
     ///
     ///         ── Gas profile (approx., Base chain) ────────────────────────────────
     ///         ~320 k–380 k gas total:
@@ -460,13 +463,15 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
         if (params.questionId == bytes32(0))
             revert BlieverMarketFactory__InvalidQuestionId();
 
+        if (params.ancillaryData.length == 0)
+            revert BlieverMarketFactory__InvalidAncillaryData();
+
         if (params.nOutcomes < MIN_OUTCOMES || params.nOutcomes > MAX_OUTCOMES)
             revert BlieverMarketFactory__InvalidOutcomeCount(params.nOutcomes);
 
         // tradingDeadline must be: strictly in the future AND < resolutionDeadline.
+        // block.timestamp is always > 0 post-merge, so the == 0 cases are subsumed.
         if (
-            params.tradingDeadline    == 0                           ||
-            params.resolutionDeadline == 0                           ||
             params.tradingDeadline    >= params.resolutionDeadline   ||
             uint40(block.timestamp)   >= params.tradingDeadline
         ) {
@@ -476,23 +481,29 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
         if (params.reward > 0 && params.rewardToken == address(0))
             revert BlieverMarketFactory__RewardTokenRequired();
 
-        // Fail-fast salt-collision guard: predict the CREATE2 address and verify
-        // it is unoccupied BEFORE any token transfers or clone deployments.
-        // This yields a descriptive revert (SaltAlreadyUsed) instead of a generic
-        // low-level CREATE2 collision revert from within the Clones library.
+        // Derive the CREATE2 salt deterministically from questionId.
+        // This enforces a strict 1-to-1 bijection: one oracle question → one market address.
+        // No operator can accidentally supply a duplicate or mismatched salt.
+        bytes32 salt = keccak256(abi.encode(params.questionId));
+
+        // Fail-fast duplicate guard: predict the CREATE2 address and verify it is unoccupied
+        // BEFORE any token transfers or clone deployments.  Yields a descriptive revert
+        // (QuestionAlreadyDeployed) instead of a generic low-level CREATE2 collision error.
         {
             address predicted = Clones.predictDeterministicAddress(
-                implementation, params.salt, address(this)
+                implementation, salt, address(this)
             );
             if (predicted.code.length > 0)
-                revert BlieverMarketFactory__SaltAlreadyUsed(params.salt, predicted);
+                revert BlieverMarketFactory__QuestionAlreadyDeployed(params.questionId, predicted);
         }
 
-        // ── 2. Compute ε from on-chain pool parameters ───────────────────────
-        // computeEpsilon reads pool.alpha() and pool.maxRiskPerMarket() and applies
-        // the LS-LMSR seed formula.  ε is never caller-supplied — protects against
-        // operator error and guarantees C(q⁰) ≈ pool.maxRiskPerMarket.
-        uint256 epsilon = computeEpsilon(params.nOutcomes);
+        // ── 2. Read pool parameters once and compute ε ───────────────────────
+        // alpha_ and maxRisk are read once here to avoid redundant external calls.
+        // alpha_ is forwarded directly to market.initialize() so the clone receives
+        // the identical value that ε was computed for — guaranteeing C(q⁰) = maxRisk.
+        uint256 alpha_  = pool.alpha();
+        uint256 maxRisk = pool.maxRiskPerMarket();
+        uint256 epsilon = _computeEpsilon(params.nOutcomes, alpha_, maxRisk);
         if (epsilon == 0) revert BlieverMarketFactory__ZeroEpsilon();
 
         // ── 3. Pull reward tokens from caller ─────────────────────────────────
@@ -507,17 +518,17 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
         // ── 4. Deploy EIP-1167 clone via CREATE2 ─────────────────────────────
         // Deploys a 45-byte proxy shell forwarding all DELEGATECALL logic to `implementation`.
         // Deployment cost is ~41 k gas (>90 % cheaper than full contract deployment).
-        // The address is deterministic: predictMarketAddress(params.salt) == market.
-        market = Clones.cloneDeterministic(implementation, params.salt);
+        // The address is deterministic: predictMarketAddress(params.questionId) == market.
+        market = Clones.cloneDeterministic(implementation, salt);
 
         // ── 5. Initialize the clone ───────────────────────────────────────────
-        // Snapshot pool.alpha() at deployment time (LS-LMSR: spread is fixed at creation).
+        // alpha_ is the value read above — the same one used for ε.
         // The clone sets its internal state: pool, resolver, factory, q-vector, deadlines.
         IDeployableMarket(market).initialize(
             address(pool),
             params.questionId,
             params.nOutcomes,
-            pool.alpha(),             // alpha snapshot — immutable per market
+            alpha_,                   // cached above — identical to epsilon's alpha
             params.tradingDeadline,
             params.resolutionDeadline,
             epsilon,
@@ -562,8 +573,7 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
             params.questionId,
             params.nOutcomes,
             params.tradingDeadline,
-            params.resolutionDeadline,
-            params.salt
+            params.resolutionDeadline
         );
     }
 
@@ -685,25 +695,28 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
                          EXTERNAL — READ-ONLY VIEWS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Pre-compute the deterministic address a clone will receive for a given salt.
+    /// @notice Pre-compute the deterministic address a clone will receive for a given questionId.
     ///
-    ///         This is mathematically equivalent to the CREATE2 computation performed inside
-    ///         deployMarket.  Off-chain systems (order engines, frontends) can use this to
-    ///         route limit orders and liquidity to the market address BEFORE the deployment
+    ///         Mathematically equivalent to the CREATE2 computation performed inside
+    ///         deployMarket.  The salt is derived as keccak256(abi.encode(questionId)),
+    ///         mirroring the derivation in deployMarket exactly.
+    ///
+    ///         Off-chain systems (order engines, frontends) can use this to route limit orders
+    ///         and display market data at the pre-computed address BEFORE the deployment
     ///         transaction is broadcast — the "lazy deployment" pattern described in the research.
     ///
-    ///         If the returned address already contains bytecode, the salt cannot be reused
-    ///         (deployMarket will revert with SaltAlreadyUsed).
+    ///         If the returned address already contains bytecode, a deployment for this
+    ///         questionId has already succeeded (deployMarket will revert with
+    ///         QuestionAlreadyDeployed).
     ///
-    ///         Recommended salt derivation: keccak256(abi.encode(questionId)).
-    ///
-    /// @param salt  CREATE2 salt (must match the `salt` field in the future DeployParams)
+    /// @param questionId  Oracle question identifier (must match the future DeployParams.questionId)
     /// @return predicted  The address the clone will occupy after deployment
-    function predictMarketAddress(bytes32 salt)
+    function predictMarketAddress(bytes32 questionId)
         external
         view
         returns (address predicted)
     {
+        bytes32 salt = keccak256(abi.encode(questionId));
         predicted = Clones.predictDeterministicAddress(
             implementation, salt, address(this)
         );
@@ -737,8 +750,8 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
     ///
     ///         ── Why exposed as a public view ────────────────────────────────────
     ///         Operators can call this off-chain before constructing a DeployParams to
-    ///         verify the ε that deployMarket will use.  The same computation runs inside
-    ///         deployMarket — ε is never caller-supplied.
+    ///         verify the ε that deployMarket will use.  Inside deployMarket the internal
+    ///         _computeEpsilon helper is used instead, with pool parameters cached once.
     ///
     /// @param nOutcomes  Number of mutually exclusive outcomes [MIN_OUTCOMES, MAX_OUTCOMES]
     /// @return epsilon   Initial per-outcome seed quantity (18-dec, LSMath scale)
@@ -750,33 +763,7 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
         if (nOutcomes < MIN_OUTCOMES || nOutcomes > MAX_OUTCOMES)
             revert BlieverMarketFactory__InvalidOutcomeCount(nOutcomes);
 
-        uint256 alpha_  = pool.alpha();
-        uint256 maxRisk = pool.maxRiskPerMarket();
-
-        // Scale 6-dec USDC maxRisk to 18-dec to match LSMath SCALE.
-        // maxRisk (e.g. 1e9 = $1 000 USDC) → R18 (e.g. 1e21, 18-dec).
-        uint256 R18 = maxRisk * SHARE_TO_USDC;
-
-        // Natural log of nOutcomes in 18-dec fixed-point.
-        uint256 lnN = _lnLookup(nOutcomes);
-
-        // denominator = (1 + α·n·ln n) expressed in 18-dec fixed-point.
-        //
-        // Overflow analysis:
-        //   alpha_ ≤ MAX_ALPHA = 2e17
-        //   nOutcomes ≤ 7
-        //   lnN ≤ ln(7) × 1e18 ≈ 1.946e18
-        //   alpha_ * nOutcomes * lnN ≤ 2e17 * 7 * 1.946e18 = 2.72e36 < 2^256 ✓
-        //   After dividing by MATH_SCALE: ≤ 2.72e18, well within uint256 range ✓
-        uint256 denominator = MATH_SCALE + (alpha_ * nOutcomes * lnN) / MATH_SCALE;
-
-        // ε = R / (1 + α·n·ln n) in 18-dec.
-        //
-        // Overflow analysis:
-        //   R18 = maxRisk * 1e12 (maxRisk is 6-dec USDC)
-        //   For a realistic maxRisk of $1M USDC: maxRisk = 1e12, R18 = 1e24.
-        //   R18 * MATH_SCALE = 1e24 * 1e18 = 1e42 < 2^256 ✓
-        epsilon = (R18 * MATH_SCALE) / denominator;
+        epsilon = _computeEpsilon(nOutcomes, pool.alpha(), pool.maxRiskPerMarket());
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -790,6 +777,36 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
     function _assertDeployedMarket(address market) internal view {
         if (!isDeployedMarket[market])
             revert BlieverMarketFactory__NotDeployedMarket(market);
+    }
+
+    /// @dev Core LS-LMSR epsilon arithmetic.  Accepts pre-read pool parameters so that
+    ///      deployMarket can supply cached values (eliminating a redundant pool.alpha() call),
+    ///      while the public computeEpsilon view reads them fresh on every external call.
+    ///
+    ///      Formula: ε = R / (1 + α·n·ln n)
+    ///
+    ///      Overflow analysis (same as computeEpsilon NatSpec):
+    ///        alpha_ * nOutcomes * lnN ≤ 2e17 * 7 * 1.946e18 ≈ 2.72e36 < 2^256 ✓
+    ///        R18 * MATH_SCALE         ≤ 1e12 * 1e12 * 1e18 = 1e42 < 2^256 ✓
+    ///
+    /// @param nOutcomes  Pre-validated outcome count ∈ [2, 7]
+    /// @param alpha_     pool.alpha() in 18-dec fixed-point
+    /// @param maxRisk    pool.maxRiskPerMarket() in 6-dec USDC
+    /// @return epsilon   ε in 18-dec fixed-point
+    function _computeEpsilon(uint8 nOutcomes, uint256 alpha_, uint256 maxRisk)
+        internal
+        pure
+        returns (uint256 epsilon)
+    {
+        // Scale 6-dec USDC maxRisk to 18-dec to match LSMath SCALE.
+        uint256 R18 = maxRisk * SHARE_TO_USDC;
+
+        // denominator = (1 + α·n·ln n) in 18-dec fixed-point.
+        uint256 lnN         = _lnLookup(nOutcomes);
+        uint256 denominator = MATH_SCALE + (alpha_ * nOutcomes * lnN) / MATH_SCALE;
+
+        // ε = R / (1 + α·n·ln n) in 18-dec.
+        epsilon = (R18 * MATH_SCALE) / denominator;
     }
 
     /// @dev Precomputed natural-log lookup table for n ∈ [2, 7], 18-dec fixed-point.
