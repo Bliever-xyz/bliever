@@ -4,7 +4,7 @@ pragma solidity 0.8.31;
 import {IBlieverMarket} from "./IBlieverMarket.sol";
 
 /// @dev Minimal interface for the factory-specific calls into BlieverMarket clones.
-interface IDeployableMarket {
+interface IDeployableMarket is IBlieverMarket {
     /// @dev Called once, immediately after clone deployment.
     function initialize(
         address _pool,
