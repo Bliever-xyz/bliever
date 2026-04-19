@@ -19,6 +19,7 @@ import {IERC20Permit}             from "@openzeppelin/contracts/token/ERC20/exte
 //////////////////////////////////////////////////////////////*/
 import {LSMath}         from "./LSMath.sol";
 import {IBlieverV1Pool} from "./interfaces/IBlieverV1Pool.sol";
+import {IDeployableMarket} from "./interfaces/IDeployableMarket.sol";
 
 /// @title  BlieverMarket — LS-LMSR Prediction Market Implementation
 /// @author Believer Protocol
@@ -76,7 +77,7 @@ import {IBlieverV1Pool} from "./interfaces/IBlieverV1Pool.sol";
 ///         No UUPS upgrade logic — clones are immutable by design (security requirement).
 ///         ReentrancyGuardTransient uses EIP-1153 transient storage: no persistent slot consumed
 ///         and no initialiser call required, saving ~2 000 gas on every guarded function.
-contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgradeable {
+contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgradeable, IDeployableMarket {
 
     /*//////////////////////////////////////////////////////////////
                               CONSTANTS
@@ -1122,7 +1123,7 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     function getMarketStatus() external view returns (
         bool    _resolved,
         uint8   _winningOutcome,
-        bool    _tradingOpen,
+        bool    isTradingOpen,
         uint40  _tradingDeadline_,
         uint40  _resolutionDeadline_,
         uint256 _totalVolumeShares
