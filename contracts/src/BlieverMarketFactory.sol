@@ -16,6 +16,7 @@ import {SafeERC20}        from "@openzeppelin/contracts/token/ERC20/utils/SafeER
 //////////////////////////////////////////////////////////////*/
 import {IBlieverV1Pool}      from "./interfaces/IBlieverV1Pool.sol";
 import {IBlieverUmaAdapter}  from "./interfaces/IBlieverUmaAdapter.sol";
+import {IDeployableMarket} from "./interfaces/IDeployableMarket.sol";
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  DEPLOYMENT PARAMETER BUNDLE
