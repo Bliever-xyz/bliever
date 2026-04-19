@@ -27,13 +27,4 @@ interface IDeployableMarket {
     /// @dev Forces a zero-payout settlement once resolutionDeadline has passed.
     ///      Callable only by `factory`.
     function expireUnresolved() external;
-
-    /// @dev Unix timestamp past which resolve() may no longer be called.
-    function resolutionDeadline() external view returns (uint40);
-
-    /// @dev True after resolve() has succeeded on this clone.
-    function resolved() external view returns (bool);
-
-    /// @dev keccak256 of the full ancillary data (set at initialize).
-    function questionId() external view returns (bytes32);
 }
