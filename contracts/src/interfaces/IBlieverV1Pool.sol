@@ -71,6 +71,7 @@ interface IBlieverV1Pool {
     /// @param amount  USDC to transfer (6-dec; must not exceed remaining settlement budget)
     function claimWinnings(address winner, uint256 amount) external;
 
+
     /*//////////////////////////////////////////////////////////////
                            READ-ONLY QUERIES
     //////////////////////////////////////////////////////////////*/
@@ -79,4 +80,12 @@ interface IBlieverV1Pool {
     /// @dev    Used by BlieverMarket to surface the USDC address to external callers
     ///         via `usdcToken()` without storing a redundant copy.
     function asset() external view returns (address);
+
+    function alpha() external view returns (uint256);
+
+    function maxRiskPerMarket() external view returns (uint256);
+
+    function registerMarket(address market, uint32 nOutcomes) external;
+    
+    function deregisterMarket(address market) external;
 }
