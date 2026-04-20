@@ -1123,7 +1123,7 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     function getMarketStatus() external view returns (
         bool    _resolved,
         uint8   _winningOutcome,
-        bool    isTradingOpen,
+        bool    _tradingOpen,
         uint40  _tradingDeadline_,
         uint40  _resolutionDeadline_,
         uint256 _totalVolumeShares
