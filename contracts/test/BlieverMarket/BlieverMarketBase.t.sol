@@ -168,6 +168,23 @@ contract MockPool is IBlieverV1Pool {
         settleCalls  = 0;
         claimCalls   = 0;
     }
+
+    function alpha() external pure override returns (uint256) {
+        return 3e16; // 3 % — matches BlieverMarketBase ALPHA constant
+    }
+
+    function maxRiskPerMarket() external pure override returns (uint256) {
+        return 500e6; // 500 USDC — matches BlieverMarketBase MAX_RISK_USDC constant
+    }
+
+    function registerMarket(address, uint32) external override {
+        // no-op: BlieverMarket never calls this; only the factory does
+    }
+
+    function deregisterMarket(address) external override {
+        // no-op: BlieverMarket never calls this; only the factory does
+    }
+
 }
 
 /*//////////////////////////////////////////////////////////////
