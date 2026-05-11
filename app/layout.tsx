@@ -1,52 +1,49 @@
-import type { Metadata } from "next";
-import { Inter, Source_Code_Pro } from "next/font/google";
-import { SafeArea } from "@coinbase/onchainkit/minikit";
-import { minikitConfig } from "@/minikit.config";
-import { RootProvider } from "./rootProvider";
-import "./globals.css";
+// app/layout.tsx
+import { CDPReactProvider } from "@coinbase/cdp-react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { WagmiProvider } from "wagmi";
+import { baseSepolia } from "wagmi/chains";
+import { http, createConfig } from "wagmi";
+import { baseAccount } from "@base-org/account";
 
-export async function generateMetadata(): Promise<Metadata> {
-  return {
-    title: minikitConfig.miniapp.name,
-    description: minikitConfig.miniapp.description,
-    other: {
-      "fc:miniapp": JSON.stringify({
-        version: minikitConfig.miniapp.version,
-        imageUrl: minikitConfig.miniapp.heroImageUrl,
-        button: {
-          title: `Launch ${minikitConfig.miniapp.name}`,
-          action: {
-            name: `Launch ${minikitConfig.miniapp.name}`,
-            type: "launch_miniapp",
-          },
-        },
-      }),
-    },
-  };
-}
-
-const inter = Inter({
-  variable: "--font-inter",
-  subsets: ["latin"],
+// Create wagmi config for Base Account support
+const config = createConfig({
+  chains: [baseSepolia],
+  transports: {
+    [baseSepolia.id]: http(),
+  },
+  connectors: [
+    baseAccount(), // Base Account connector
+  ],
 });
 
-const sourceCodePro = Source_Code_Pro({
-  variable: "--font-source-code-pro",
-  subsets: ["latin"],
-});
+const queryClient = new QueryClient();
 
 export default function RootLayout({
   children,
-}: Readonly<{
+}: {
   children: React.ReactNode;
-}>) {
+}) {
   return (
-    <RootProvider>
-      <html lang="en">
-        <body className={`${inter.variable} ${sourceCodePro.variable}`}>
-          <SafeArea>{children}</SafeArea>
-        </body>
-      </html>
-    </RootProvider>
+    <html lang="en">
+      <body>
+        <CDPReactProvider
+          config={{
+            projectId: process.env.NEXT_PUBLIC_CDP_PROJECT_ID!,
+            appName: process.env.NEXT_PUBLIC_CDP_APP_NAME!,
+            ethereum: {
+              createOnLogin: "smart", // ✅ ERC-4337 Smart Account
+              chainId: parseInt(process.env.NEXT_PUBLIC_BASE_CHAIN_ID || "84532"),
+            },
+          }}
+        >
+          <WagmiProvider config={config}>
+            <QueryClientProvider client={queryClient}>
+              {children}
+            </QueryClientProvider>
+          </WagmiProvider>
+        </CDPReactProvider>
+      </body>
+    </html>
   );
 }
