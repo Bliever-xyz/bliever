@@ -19,7 +19,17 @@
 import { createPublicClient, http } from "viem";
 import { base, baseSepolia } from "viem/chains";
 
-const chainId = process.env.NEXT_PUBLIC_BASE_CHAIN_ID;
+const VALID_CHAIN_IDS = ["8453", "84532"] as const;
+const chainId = process.env.NEXT_PUBLIC_BASE_CHAIN_ID ?? "84532";
+
+if (!VALID_CHAIN_IDS.includes(chainId as (typeof VALID_CHAIN_IDS)[number])) {
+  throw new Error(
+    `[lib/evm/client] Invalid NEXT_PUBLIC_BASE_CHAIN_ID: "${chainId}". ` +
+    `Must be "8453" (Base Mainnet) or "84532" (Base Sepolia). ` +
+    `Check your .env / deployment environment variables.`,
+  );
+}
+
 const isMainnet = chainId === "8453";
 
 const chain = isMainnet ? base : baseSepolia;
