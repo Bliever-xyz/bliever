@@ -148,6 +148,13 @@ export async function validateBindingPayload(
     timestamp,
   } = payload;
 
+  // ── Timestamp redundancy note ─────────────────────────────────────────────
+  // `timestamp` appears in three places: the top-level payload, the Nostr
+  // event's `created_at`, and inside `NostrBindingClaim.timestamp` (content).
+  // This redundancy is intentional: each layer is signed independently, so
+  // an attacker cannot alter the timestamp in one place without invalidating
+  // a cryptographic proof in another. Do not collapse these fields.
+
   // 1. Timestamp
   if (!checkTimestamp(timestamp)) {
     return { valid: false, reason: "timestamp_expired" };
