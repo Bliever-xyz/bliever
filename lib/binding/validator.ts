@@ -16,6 +16,7 @@
 import {
   NOSTR_BINDING_KIND,
   NOSTR_BINDING_D_TAG,
+  ONBOARDING_VERSION,
   BINDING_TIMESTAMP_WINDOW_SEC,
   type BindIdentityPayload,
   type BindingErrorReason,
@@ -50,6 +51,16 @@ type StructureResult = StructureOk | StructureFail;
 type ParseOk = { claim: NostrBindingClaim };
 type ParseFail = { error: BindingErrorReason };
 type ParseResult = ParseOk | ParseFail;
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+/**
+ * RFC 4122 UUID v4 pattern.
+ * Used to reject malformed `bindingId` values before they reach the ERC-1271
+ * RPC call — an inexpensive local guard that preserves the fail-fast ordering.
+ */
+const UUID_V4_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 // ─── Individual validators (pure / synchronous) ───────────────────────────────
 
@@ -105,7 +116,7 @@ export function parseBindingClaim(content: string): ParseResult {
       typeof raw.evmAddress !== "string" ||
       typeof raw.timestamp !== "number" ||
       typeof raw.bindingId !== "string" ||
-      typeof raw.version !== "string" ||
+      raw.version !== ONBOARDING_VERSION ||
       typeof raw.appId !== "string"
     ) {
       return { error: "invalid_claim_fields" };
@@ -126,6 +137,7 @@ export function parseBindingClaim(content: string): ParseResult {
  *   1. Timestamp freshness          (local, O(1))
  *   2. Nostr event structure        (local, O(tags))
  *   3. Nostr pubkey match           (local, O(1))
+ *   3.5 BindingId UUID format       (local, O(1))
  *   4. Nostr Schnorr signature      (local CPU, secp256k1)
  *   5. Claim JSON parsing           (local, O(content))
  *   6. EVM address normalisation    (local, O(1))
@@ -169,6 +181,14 @@ export async function validateBindingPayload(
   // 3. Nostr pubkey must match the supplied npub
   if (nostrEvent.pubkey !== npub) {
     return { valid: false, reason: "nostr_pubkey_mismatch" };
+  }
+
+  // 3.5. BindingId format — reject malformed UUIDs before touching the network.
+  // A syntactically invalid UUID cannot match any claim and would waste the
+  // ERC-1271 RPC call at step 9. Checked here (after structural steps, before
+  // crypto) to maintain cheapest-first ordering.
+  if (!UUID_V4_REGEX.test(bindingId)) {
+    return { valid: false, reason: "invalid_binding_id" };
   }
 
   // 4. Nostr Schnorr signature verification (CPU-only, no network)
