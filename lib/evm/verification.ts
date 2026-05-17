@@ -62,7 +62,14 @@ export async function verifyEVMSignature(
       message,
       signature,
     });
-  } catch {
+  } catch (err) {
+    // Log before returning so RPC failures (network, timeout, rate-limit) are
+    // distinguishable from bad signatures in production observability tooling.
+    // The boolean contract is preserved — callers still receive `false`.
+    console.error("[evm/verification] verifyEVMSignature failed", {
+      expectedAddress,
+      error: err instanceof Error ? err.message : String(err),
+    });
     return false;
   }
 }
