@@ -239,5 +239,6 @@ export type BindingErrorReason =
   | "invalid_evm_signature"
   // Cross-field consistency
   | "binding_id_mismatch"
+  | "invalid_binding_id"
   // Server
   | "internal_error";
