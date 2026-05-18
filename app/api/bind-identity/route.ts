@@ -27,6 +27,12 @@
  * No data is persisted here. The indexer service should call this endpoint
  * and store the result only after receiving a 200 response.
  *
+ * ─── Rate limiting ───────────────────────────────────────────────────────────
+ * An in-memory sliding-window limiter caps each source IP at 10 requests per
+ * minute. For multi-instance deployments this must be replaced with a shared
+ * backing store (e.g. Redis via Upstash). Exceeding the limit returns 429 with
+ * reason "rate_limited".
+ *
  * ─── Request  ────────────────────────────────────────────────────────────────
  * Body (JSON): BindIdentityPayload
  * {
@@ -41,6 +47,7 @@
  * ─── Response ────────────────────────────────────────────────────────────────
  * 200 BindingSuccessResponse
  * 400 BindingErrorResponse  (see BindingErrorReason for all codes)
+ * 429 BindingErrorResponse  { reason: "rate_limited" }
  * 500 BindingErrorResponse  { reason: "internal_error" }
  */
 
@@ -51,9 +58,39 @@ import type {
 } from "@/lib/binding/schema";
 import { validateBindingPayload } from "@/lib/binding/validator";
 
+// ─── Rate limiting ────────────────────────────────────────────────────────────
+// Simple in-memory sliding-window limiter (per source IP).
+// Replace the backing store with Redis for multi-instance deployments.
+const RL_MAX_REQUESTS = 10;
+const RL_WINDOW_MS = 60_000; // 1 minute
+
+const _rlStore = new Map<string, { count: number; resetAt: number }>();
+
+function isRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const entry = _rlStore.get(ip);
+  if (!entry || now >= entry.resetAt) {
+    _rlStore.set(ip, { count: 1, resetAt: now + RL_WINDOW_MS });
+    return false;
+  }
+  if (entry.count >= RL_MAX_REQUESTS) return true;
+  entry.count += 1;
+  return false;
+}
+
 export async function POST(
   request: NextRequest,
 ): Promise<NextResponse<BindingResponse>> {
+  // ── 0. Rate limit ─────────────────────────────────────────────────────────
+  const ip =
+    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "unknown";
+  if (isRateLimited(ip)) {
+    return NextResponse.json(
+      { success: false, reason: "rate_limited" } as BindingResponse,
+      { status: 429 },
+    );
+  }
+
   // ── 1. Parse request body ─────────────────────────────────────────────────
   let payload: BindIdentityPayload;
 
