@@ -1,5 +1,10 @@
+"use client";
+
 /**
  * lib/crypto/nsec-storage.ts
+ *
+ * CLIENT-ONLY MODULE — requires IndexedDB, Web Crypto, and WebAuthn (PRF strategy).
+ * The "use client" directive above prevents Next.js from bundling this on the server.
  *
  * Encrypted persistence of the Nostr secret key (nsec) in IndexedDB.
  *
