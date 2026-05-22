@@ -1,5 +1,9 @@
+"use client";
+
 /**
  * lib/nostr/relay.ts
+ *
+ * CLIENT-ONLY MODULE — requires browser WebSocket APIs.
  *
  * Publishes the signed Kind 30078 binding event to one or more Nostr relays.
  *
@@ -8,8 +12,12 @@
  *   Parallel publication — all relays are attempted concurrently. There is no
  *   reason to serialise; individual relay failures are non-fatal.
  *
- *   Per-relay timeout — each relay gets its own AbortController-backed timeout
- *   (default 8 s). A slow relay does not block the others.
+ *   Per-relay timeout — each relay gets its own timeout (default 8 s). A slow
+ *   relay does not block the others.
+ *
+ *   Per-relay retry — each relay is retried up to `maxRetries` times (default 2)
+ *   with linear backoff (1 s × attempt). Handles transient failures common on
+ *   mobile connections without blocking the overall publish pass.
  *
  *   Partial success is ok — the caller (`flow.ts`) only needs at least one
  *   relay to accept the event for the social graph to be discoverable.
@@ -45,42 +53,51 @@ export interface PublishResult {
 
 /**
  * Connects to one relay, publishes the event, and closes the connection.
+ * Retries up to `maxRetries` times with linear backoff (1 s × attempt number).
  * Returns a resolved outcome regardless of success/failure (never throws).
  */
 async function publishToOne(
   event: NostrBindingEvent,
   url: string,
   timeoutMs: number,
+  maxRetries: number,
 ): Promise<RelayPublishOutcome> {
-  let relay: Relay | null = null;
+  let lastError = "";
 
-  try {
-    // Race connection + publish against the per-relay timeout.
-    const connectPromise = Relay.connect(url);
-    const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(
-        () => reject(new Error(`Relay connection timed out after ${timeoutMs}ms`)),
-        timeoutMs,
-      ),
-    );
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    let relay: Relay | null = null;
 
-    relay = await Promise.race([connectPromise, timeoutPromise]);
+    try {
+      // Race connection + publish against the per-relay timeout.
+      const connectPromise = Relay.connect(url);
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`Relay connection timed out after ${timeoutMs}ms`)),
+          timeoutMs,
+        ),
+      );
 
-    // publish() resolves when the relay sends an OK acknowledgement,
-    // or rejects if the relay sends NOTICE with a rejection reason.
-    await relay.publish(event as Parameters<typeof relay.publish>[0]);
+      relay = await Promise.race([connectPromise, timeoutPromise]);
 
-    return { url, success: true };
-  } catch (err) {
-    return {
-      url,
-      success: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
-  } finally {
-    // Always close to avoid leaving dangling WebSocket connections.
-    relay?.close();
+      // publish() resolves when the relay sends an OK acknowledgement,
+      // or rejects if the relay sends NOTICE with a rejection reason.
+      await relay.publish(event as Parameters<typeof relay.publish>[0]);
+
+      return { url, success: true };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+
+      // Linear backoff before the next attempt (skipped after the final one).
+      if (attempt < maxRetries) {
+        await new Promise((resolve) => setTimeout(resolve, 1_000 * (attempt + 1)));
+      }
+    } finally {
+      // Always close to avoid leaving dangling WebSocket connections.
+      relay?.close();
+    }
   }
+
+  return { url, success: false, error: lastError };
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -88,18 +105,21 @@ async function publishToOne(
 /**
  * Publishes a signed Nostr event to multiple relays in parallel.
  *
- * All relays are attempted concurrently. Each relay has an independent timeout.
+ * All relays are attempted concurrently. Each relay has an independent timeout
+ * and is retried up to `maxRetries` times with linear backoff on failure.
  * Individual relay failures are captured and returned; they do NOT throw.
  *
- * @param event      Fully signed Kind 30078 binding event.
- * @param relayUrls  WebSocket relay URLs (wss://…).
- * @param timeoutMs  Per-relay connect+publish timeout. Default 8 000 ms.
- * @returns          Aggregated `PublishResult` with per-relay outcomes.
+ * @param event       Fully signed Kind 30078 binding event.
+ * @param relayUrls   WebSocket relay URLs (wss://…).
+ * @param timeoutMs   Per-relay connect+publish timeout per attempt. Default 8 000 ms.
+ * @param maxRetries  How many additional attempts to make per relay on failure. Default 2.
+ * @returns           Aggregated `PublishResult` with per-relay outcomes.
  */
 export async function publishEventToRelays(
   event: NostrBindingEvent,
   relayUrls: string[],
   timeoutMs = 8_000,
+  maxRetries = 2,
 ): Promise<PublishResult> {
   if (relayUrls.length === 0) {
     return { outcomes: [], atLeastOneSuccess: false };
@@ -107,7 +127,7 @@ export async function publishEventToRelays(
 
   // allSettled: we want every relay's outcome, even if some throw.
   const settled = await Promise.allSettled(
-    relayUrls.map((url) => publishToOne(event, url, timeoutMs)),
+    relayUrls.map((url) => publishToOne(event, url, timeoutMs, maxRetries)),
   );
 
   const outcomes: RelayPublishOutcome[] = settled.map((result, i) => {
