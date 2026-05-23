@@ -18,7 +18,7 @@
  * handles serialisation, hashing, and signing atomically.
  */
 
-import { finalizeEvent, type EventTemplate } from "nostr-tools";
+import { finalizeEvent, getPublicKey, type EventTemplate } from "nostr-tools";
 import {
   NOSTR_BINDING_KIND,
   NOSTR_BINDING_D_TAG,
@@ -31,8 +31,9 @@ import {
 // ─── Parameters ───────────────────────────────────────────────────────────────
 
 export interface BuildBindingEventParams {
-  /** 64-char hex Nostr public key. Used only to document intent; finalizeEvent
-   *  derives pubkey from nsec automatically. Provided for caller clarity. */
+  /** 64-char hex Nostr public key. Validated against `nsec` before building:
+   *  `getPublicKey(nsec)` must equal this value, catching key-mismatch bugs
+   *  immediately rather than producing a signature the server will reject. */
   npub: string;
   /** EIP-55 checksummed CDP Smart Account address. */
   evmAddress: string;
@@ -65,7 +66,31 @@ export interface BuildBindingEventParams {
 export function buildAndSignBindingEvent(
   params: BuildBindingEventParams,
 ): NostrBindingEvent {
-  const { evmAddress, bindingId, timestamp, nsec } = params;
+  const { npub, evmAddress, bindingId, timestamp, nsec } = params;
+
+  // ── Input guards ──────────────────────────────────────────────────────────
+  // These checks surface caller bugs immediately as local errors rather than
+  // producing a well-formed event that the server silently rejects later.
+
+  // Guard: confirm the provided npub matches the nsec before any hashing.
+  // A mismatch would produce a valid Schnorr signature that the server rejects
+  // as `nostr_pubkey_mismatch`, wasting an ERC-1271 RPC round-trip.
+  if (getPublicKey(nsec) !== npub) {
+    throw new Error(
+      `[event] npub/nsec mismatch: the derived public key does not equal the ` +
+      `provided npub. Ensure the correct nsec is supplied for this identity.`,
+    );
+  }
+
+  // Guard: reject malformed EVM addresses before building the event.
+  // Prevents an `evm_address_invalid` server rejection that wastes the signing
+  // step and an ERC-1271 RPC call.
+  if (!/^0x[0-9a-fA-F]{40}$/.test(evmAddress)) {
+    throw new Error(
+      `[event] Invalid evmAddress: "${evmAddress}". ` +
+      `Expected a 0x-prefixed 40-hex-character Ethereum address.`,
+    );
+  }
 
   // ── Construct the embedded claim ──────────────────────────────────────────
   // The claim is the semantic payload. Every field is cross-validated by the
