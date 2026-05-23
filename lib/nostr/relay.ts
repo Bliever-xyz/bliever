@@ -16,8 +16,10 @@
  *   relay does not block the others.
  *
  *   Per-relay retry — each relay is retried up to `maxRetries` times (default 2)
- *   with linear backoff (1 s × attempt). Handles transient failures common on
- *   mobile connections without blocking the overall publish pass.
+ *   with linear backoff (1 s × attempt). Retries only fire on transient errors
+ *   (timeout, network drop, WebSocket close). Permanent relay rejections such as
+ *   "BAD EVENT" or "blocked" break immediately — retrying them wastes time and
+ *   delays the overall publish outcome.
  *
  *   Partial success is ok — the caller (`flow.ts`) only needs at least one
  *   relay to accept the event for the social graph to be discoverable.
@@ -53,7 +55,17 @@ export interface PublishResult {
 
 /**
  * Connects to one relay, publishes the event, and closes the connection.
- * Retries up to `maxRetries` times with linear backoff (1 s × attempt number).
+ *
+ * A single `timeoutMs` budget covers the **entire** attempt — both the
+ * initial `Relay.connect()` and the subsequent `relay.publish()`. This
+ * prevents a relay that accepts the connection but then goes silent from
+ * hanging the slot indefinitely.
+ *
+ * Retries up to `maxRetries` times with linear backoff (1 s × attempt
+ * number), but ONLY on transient errors (timeout, network drop, WebSocket
+ * close). Permanent relay rejections (e.g. "BAD EVENT", "blocked",
+ * "duplicate") break immediately — retrying them cannot succeed.
+ *
  * Returns a resolved outcome regardless of success/failure (never throws).
  */
 async function publishToOne(
@@ -66,33 +78,40 @@ async function publishToOne(
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     let relay: Relay | null = null;
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 
     try {
-      // Race connection + publish against the per-relay timeout.
-      const connectPromise = Relay.connect(url);
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(
-          () => reject(new Error(`Relay connection timed out after ${timeoutMs}ms`)),
+      // One timeout promise covers both connect AND publish for this attempt.
+      // The handle is cleared on success to avoid a dangling timer.
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(
+          () => reject(new Error(`Relay timed out after ${timeoutMs}ms`)),
           timeoutMs,
-        ),
-      );
+        );
+      });
 
-      relay = await Promise.race([connectPromise, timeoutPromise]);
+      relay = await Promise.race([Relay.connect(url), timeoutPromise]);
 
-      // publish() resolves when the relay sends an OK acknowledgement,
-      // or rejects if the relay sends NOTICE with a rejection reason.
-      await relay.publish(event as Parameters<typeof relay.publish>[0]);
+      // publish() resolves on relay OK, rejects on NOTICE rejection.
+      // The same timeoutPromise guards against a silent relay post-connect.
+      await Promise.race([
+        relay.publish(event as Parameters<typeof relay.publish>[0]),
+        timeoutPromise,
+      ]);
 
       return { url, success: true };
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);
 
-      // Linear backoff before the next attempt (skipped after the final one).
-      if (attempt < maxRetries) {
+      // Retry only on transient failures; fail fast on permanent rejections.
+      const isTransient = /timeout|network|websocket/i.test(lastError);
+      if (attempt < maxRetries && isTransient) {
         await new Promise((resolve) => setTimeout(resolve, 1_000 * (attempt + 1)));
+      } else if (!isTransient) {
+        break; // Permanent relay rejection — skip remaining attempts.
       }
     } finally {
-      // Always close to avoid leaving dangling WebSocket connections.
+      clearTimeout(timeoutHandle);
       relay?.close();
     }
   }
