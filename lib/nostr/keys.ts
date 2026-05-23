@@ -43,8 +43,16 @@ export function generateNostrKeypair(): NostrKeypair {
  *
  * @param nsec - Raw 32-byte Nostr secret key.
  * @returns    64-char lowercase hex public key.
+ * @throws     If `nsec` is not exactly 32 bytes — catches truncated or
+ *             corrupted key material before it reaches the cryptographic layer.
  */
 export function npubFromNsec(nsec: Uint8Array): string {
+  if (nsec.length !== 32) {
+    throw new Error(
+      `nsec must be exactly 32 bytes; received ${nsec.length}. ` +
+      `The key material may be truncated or corrupted.`,
+    );
+  }
   return getPublicKey(nsec);
 }
 
