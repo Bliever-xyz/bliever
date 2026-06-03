@@ -31,6 +31,14 @@ export const BINDING_TIMESTAMP_WINDOW_SEC = 300 as const;
 export const APP_ID = "bliever-v1" as const;
 
 /**
+ * Validates that an npub is a raw 64-character lowercase hex string.
+ * Rejects bech32-encoded `npub1…` strings, which look valid to a presence
+ * check but fail the pubkey-match step with a misleading `nostr_pubkey_mismatch`
+ * error. Catching the format mismatch early produces `invalid_payload` instead.
+ */
+export const NPUB_HEX_REGEX = /^[0-9a-f]{64}$/;
+
+/**
  * The only two valid Base chain identifiers.
  * Using a union prevents accidental assignment of arbitrary strings
  * (e.g. a mistyped env var) from silently routing to the wrong network.
