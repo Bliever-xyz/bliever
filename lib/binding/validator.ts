@@ -18,6 +18,7 @@ import {
   NOSTR_BINDING_D_TAG,
   BINDING_TIMESTAMP_WINDOW_SEC,
   ONBOARDING_VERSION,
+  NPUB_HEX_REGEX,
   type BindIdentityPayload,
   type BindingErrorReason,
   type NostrBindingClaim,
@@ -76,10 +77,16 @@ export function checkTimestamp(timestamp: number): boolean {
 /**
  * Validates the structural invariants of a Nostr Kind 30078 binding event.
  *
- * Required tags:
+ * Required tags (presence AND non-empty value):
  *   d       → "identity-binding"  (namespaces the event within Kind 30078)
- *   binding → the UUID v4         (links event to the EVM consent signature)
- *   evm     → the EVM address     (queryable index tag for relay lookup)
+ *   binding → any non-empty string (links event to the EVM consent signature)
+ *   evm     → any non-empty string (queryable index tag for relay lookup)
+ *
+ * Cross-checking tag values against specific payload fields (bindingId,
+ * evmAddress) is done by the caller (`validateBindingPayload`) immediately
+ * after this check. Keeping this helper focused on structural invariants
+ * allows it to be called from `verify-identity`, which does not have a
+ * bindingId in its payload.
  */
 export function checkNostrEventStructure(
   event: NostrBindingEvent,
@@ -93,11 +100,15 @@ export function checkNostrEventStructure(
     return { ok: false, reason: "wrong_d_tag" };
   }
 
-  if (!event.tags.some((t) => t[0] === "binding")) {
+  // binding tag — must exist with a non-empty value
+  const bindingTag = event.tags.find((t) => t[0] === "binding");
+  if (!bindingTag?.[1]) {
     return { ok: false, reason: "missing_binding_tag" };
   }
 
-  if (!event.tags.some((t) => t[0] === "evm")) {
+  // evm tag — must exist with a non-empty value
+  const evmTag = event.tags.find((t) => t[0] === "evm");
+  if (!evmTag?.[1]) {
     return { ok: false, reason: "missing_evm_tag" };
   }
 
@@ -140,16 +151,24 @@ export function parseBindingClaim(content: string): ParseResult {
  * Full dual-signature binding validation.
  *
  * Execution order (fail-fast, cheapest-first):
- *   1.   Timestamp freshness          (local, O(1))
- *   2.   Nostr event structure        (local, O(tags))
- *   3.   Nostr pubkey match           (local, O(1))
- *   3.5. BindingId UUID v4 format     (local, O(1))
- *   4.   Nostr Schnorr signature      (local CPU, secp256k1)
- *   5.   Claim JSON parsing           (local, O(content))
- *   6.   EVM address normalisation    (local, O(1))
- *   7.   EVM address match in claim   (local, O(1))
- *   8.   BindingId cross-field match  (local, O(1))
- *   9.   EVM ERC-1271 signature       (network call to Base RPC)
+ *   1.   Timestamp freshness                     (local, O(1))
+ *   1.5. created_at / timestamp cross-check      (local, O(1))
+ *   2.   Nostr event structure (kind + tag pres.) (local, O(tags))
+ *   2a.  binding tag value matches bindingId      (local, O(tags))
+ *   2b.  evm tag value matches evmAddress         (local, O(tags))
+ *   2.5. npub hex format                         (local, O(1))
+ *   3.   Nostr pubkey match                      (local, O(1))
+ *   3.5. BindingId UUID v4 format                (local, O(1))
+ *   4.   Nostr Schnorr signature                 (local CPU, secp256k1)
+ *   5.   Claim JSON parsing                      (local, O(content))
+ *   6.   EVM address normalisation               (local, O(1))
+ *   7.   EVM address match in claim              (local, O(1))
+ *   8.   BindingId cross-field match             (local, O(1))
+ *   9.   EVM ERC-1271 signature                  (network call to Base RPC)
+ *
+ * Steps 2a and 2b validate that the relay-queryable `binding` and `evm` tags
+ * carry values consistent with the submitted payload, catching structural
+ * tampering before the Schnorr CPU step.
  *
  * The ERC-1271 call at step 9 is the only network-dependent step and is
  * intentionally last to minimise unnecessary RPC usage.
@@ -173,15 +192,50 @@ export async function validateBindingPayload(
   // an attacker cannot alter the timestamp in one place without invalidating
   // a cryptographic proof in another. Do not collapse these fields.
 
-  // 1. Timestamp
+  // 1. Timestamp freshness
   if (!checkTimestamp(timestamp)) {
     return { valid: false, reason: "timestamp_expired" };
   }
 
-  // 2. Nostr event structure
+  // 1.5. created_at / timestamp cross-check
+  // Ensures the Nostr event's `created_at` field matches the top-level
+  // `timestamp`. Without this check, an attacker could reuse a valid old
+  // Nostr event (whose Schnorr sig still verifies) while supplying a fresh
+  // `timestamp` that passes the freshness window and drives EVM consent
+  // message reconstruction — making two proofs from different moments appear
+  // to form a valid binding.
+  if (nostrEvent.created_at !== timestamp) {
+    return { valid: false, reason: "timestamp_expired" };
+  }
+
+  // 2. Nostr event structure — kind, d-tag, tag presence and non-empty values
   const structureResult = checkNostrEventStructure(nostrEvent);
   if (!structureResult.ok) {
     return { valid: false, reason: structureResult.reason };
+  }
+
+  // 2a. binding tag value must match the submitted bindingId.
+  // The tag is supposed to be a relay-queryable copy of the bindingId;
+  // validating its value here (cheap, local) catches tampered tags before
+  // the Schnorr CPU step and the ERC-1271 RPC call.
+  const bindingTagValue = nostrEvent.tags.find((t) => t[0] === "binding")?.[1]!;
+  if (bindingTagValue !== bindingId) {
+    return { valid: false, reason: "binding_id_mismatch" };
+  }
+
+  // 2b. evm tag value must match the submitted evmAddress (case-insensitive;
+  // exact EIP-55 checksum comparison happens at step 6).
+  const evmTagValue = nostrEvent.tags.find((t) => t[0] === "evm")?.[1]!;
+  if (evmTagValue.toLowerCase() !== evmAddress.toLowerCase()) {
+    return { valid: false, reason: "evm_address_mismatch" };
+  }
+
+  // 2.5. npub must be a 64-character lowercase hex string.
+  // Rejects bech32-encoded `npub1…` strings, which pass a presence check but
+  // fail the pubkey-match at step 3 with the misleading `nostr_pubkey_mismatch`
+  // error. Catching the format problem here returns `invalid_payload` instead.
+  if (!NPUB_HEX_REGEX.test(npub)) {
+    return { valid: false, reason: "invalid_payload" };
   }
 
   // 3. Nostr pubkey must match the supplied npub
