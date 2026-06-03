@@ -51,6 +51,23 @@ export interface PublishResult {
   atLeastOneSuccess: boolean;
 }
 
+// ─── Internal: URL validation ─────────────────────────────────────────────────
+
+/**
+ * Returns `true` if `url` is a syntactically valid WebSocket URL.
+ * Filters out common mistakes such as http:// URLs or bare hostnames before
+ * the connection attempt, preventing an 8-second timeout on a locally-
+ * detectable error.
+ */
+function isValidRelayUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "wss:" || parsed.protocol === "ws:";
+  } catch {
+    return false;
+  }
+}
+
 // ─── Internal: single-relay publish ──────────────────────────────────────────
 
 /**
@@ -128,6 +145,10 @@ async function publishToOne(
  * and is retried up to `maxRetries` times with linear backoff on failure.
  * Individual relay failures are captured and returned; they do NOT throw.
  *
+ * URLs that are not valid WebSocket addresses (wss:// or ws://) are rejected
+ * immediately without attempting a connection. Their outcomes are returned with
+ * `success: false` so the caller can identify misconfigured relay lists.
+ *
  * @param event       Fully signed Kind 30078 binding event.
  * @param relayUrls   WebSocket relay URLs (wss://…).
  * @param timeoutMs   Per-relay connect+publish timeout per attempt. Default 8 000 ms.
@@ -144,23 +165,47 @@ export async function publishEventToRelays(
     return { outcomes: [], atLeastOneSuccess: false };
   }
 
+  // Partition URLs up front: invalid URLs get an immediate failure outcome
+  // rather than wasting a full timeoutMs slot before failing.
+  const validUrls = relayUrls.filter(isValidRelayUrl);
+  const invalidUrls = relayUrls.filter((u) => !isValidRelayUrl(u));
+
+  if (invalidUrls.length > 0) {
+    console.warn(
+      "[relay] Skipping invalid relay URLs (must start with wss:// or ws://):",
+      invalidUrls,
+    );
+  }
+
+  const invalidOutcomes: RelayPublishOutcome[] = invalidUrls.map((url) => ({
+    url,
+    success: false,
+    error: "Invalid relay URL: must be a wss:// or ws:// WebSocket address.",
+  }));
+
+  if (validUrls.length === 0) {
+    return { outcomes: invalidOutcomes, atLeastOneSuccess: false };
+  }
+
   // allSettled: we want every relay's outcome, even if some throw.
   const settled = await Promise.allSettled(
-    relayUrls.map((url) => publishToOne(event, url, timeoutMs, maxRetries)),
+    validUrls.map((url) => publishToOne(event, url, timeoutMs, maxRetries)),
   );
 
-  const outcomes: RelayPublishOutcome[] = settled.map((result, i) => {
+  const validOutcomes: RelayPublishOutcome[] = settled.map((result, i) => {
     if (result.status === "fulfilled") return result.value;
     // A rejected promise from publishToOne means an unexpected throw;
     // publishToOne is written to never throw, but defensive guard stays.
     return {
-      url: relayUrls[i] ?? "unknown",
+      url: validUrls[i] ?? "unknown",
       success: false,
       error: result.reason instanceof Error
         ? result.reason.message
         : String(result.reason),
     };
   });
+
+  const outcomes = [...validOutcomes, ...invalidOutcomes];
 
   return {
     outcomes,
