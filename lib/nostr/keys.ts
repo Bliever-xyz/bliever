@@ -15,7 +15,8 @@
  */
 
 import { generateSecretKey, getPublicKey } from "nostr-tools";
-import type { NostrKeypair } from "../binding/schema";
+import * as nip19 from "nostr-tools/nip19";
+import type { NostrKeypair, NostrPubkeyHex } from "../binding/schema";
 
 // ─── Keypair generation ───────────────────────────────────────────────────────
 
@@ -41,19 +42,81 @@ export function generateNostrKeypair(): NostrKeypair {
  * Useful after recovering the nsec from storage, when the npub must be
  * recomputed for signing a new event.
  *
+ * Returns a branded `NostrPubkeyHex` so downstream callers are type-checked
+ * against accidental use of bech32-encoded strings. `getPublicKey` always
+ * returns exactly 64 lowercase hex characters, so the cast is safe.
+ *
  * @param nsec - Raw 32-byte Nostr secret key.
- * @returns    64-char lowercase hex public key.
+ * @returns    Branded 64-char lowercase hex public key.
  * @throws     If `nsec` is not exactly 32 bytes — catches truncated or
  *             corrupted key material before it reaches the cryptographic layer.
  */
-export function npubFromNsec(nsec: Uint8Array): string {
+export function npubFromNsec(nsec: Uint8Array): NostrPubkeyHex {
   if (nsec.length !== 32) {
     throw new Error(
       `nsec must be exactly 32 bytes; received ${nsec.length}. ` +
       `The key material may be truncated or corrupted.`,
     );
   }
-  return getPublicKey(nsec);
+  return getPublicKey(nsec) as NostrPubkeyHex;
+}
+
+// ─── NIP-19 bech32 encoding/decoding ─────────────────────────────────────────
+
+/**
+ * Converts a Nostr public key to a branded `NostrPubkeyHex`.
+ *
+ * Accepts two input forms so callers don't need to pre-check the format:
+ *   • 64-char lowercase hex string — validated and branded directly.
+ *   • `npub1…` bech32 string — decoded via NIP-19, checksum validated by
+ *     `nostr-tools/nip19`, then branded.
+ *
+ * This is the correct entry point when accepting user-supplied npub values
+ * (e.g. from a paste or URL param). Once the value passes through here it
+ * is safe to pass anywhere a `NostrPubkeyHex` is required.
+ *
+ * @param input - Either a 64-char hex pubkey or an `npub1…` bech32 string.
+ * @returns     Branded `NostrPubkeyHex`.
+ * @throws      If the input is neither valid hex nor a valid `npub1…` string.
+ */
+export function toHexNpub(input: string): NostrPubkeyHex {
+  // Case 1: already raw hex — validate format and brand it.
+  // Must be exactly 64 lowercase hex chars to match NPUB_HEX_REGEX.
+  if (/^[0-9a-f]{64}$/.test(input)) {
+    return input as NostrPubkeyHex;
+  }
+
+  // Case 2: bech32 npub1… — decode with built-in checksum validation.
+  try {
+    const decoded = nip19.decode(input);
+    if (decoded.type !== "npub") {
+      throw new Error(
+        `Expected npub, got "${decoded.type}". ` +
+        `Pass a 64-char hex pubkey or an npub1… bech32 string.`,
+      );
+    }
+    return decoded.data as NostrPubkeyHex;
+  } catch (err) {
+    throw new Error(
+      `[keys] toHexNpub: invalid input "${input.slice(0, 20)}…". ` +
+      `Expected 64-char lowercase hex or npub1… bech32. ` +
+      `Cause: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
+ * Encodes a branded hex public key to its human-readable `npub1…` bech32
+ * representation for display in the UI.
+ *
+ * `npubEncode` and `toHexNpub` are exact inverses:
+ *   `toHexNpub(toDisplayNpub(hex)) === hex`
+ *
+ * @param hexNpub - Branded 64-char hex public key.
+ * @returns       `npub1…` bech32 string suitable for display or sharing.
+ */
+export function toDisplayNpub(hexNpub: NostrPubkeyHex): string {
+  return nip19.npubEncode(hexNpub);
 }
 
 // ─── Binary encoding utilities ────────────────────────────────────────────────
