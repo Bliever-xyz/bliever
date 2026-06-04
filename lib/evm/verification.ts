@@ -18,17 +18,20 @@
 
 import { verifyMessage, getAddress } from "viem";
 import { basePublicClient } from "./client";
-import type { HexString } from "../binding/schema";
+import type { HexString, EvmAddressChecksummed } from "../binding/schema";
 
 /**
- * Returns the EIP-55 checksummed form of `address`, or `null` if the input
- * is not a valid Ethereum address.
+ * Returns the EIP-55 checksummed form of `address` as a branded
+ * `EvmAddressChecksummed`, or `null` if the input is not a valid Ethereum
+ * address.
  *
- * Used to normalise addresses before comparison (case-insensitive by spec).
+ * The branded return type ensures downstream callers work only with addresses
+ * that have passed through viem's checksum validation. Use this as the
+ * single entry point when normalising any externally-supplied EVM address.
  */
-export function safeNormalizeAddress(address: string): string | null {
+export function safeNormalizeAddress(address: string): EvmAddressChecksummed | null {
   try {
-    return getAddress(address);
+    return getAddress(address) as EvmAddressChecksummed;
   } catch {
     return null;
   }
