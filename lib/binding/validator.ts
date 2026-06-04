@@ -23,6 +23,7 @@ import {
   type BindingErrorReason,
   type NostrBindingClaim,
   type NostrBindingEvent,
+  type EvmAddressChecksummed,
 } from "./schema";
 import { buildEVMConsentMessage } from "./message";
 import { verifyNostrEvent } from "../nostr/verification";
@@ -43,7 +44,7 @@ const UUID_V4_REGEX =
 export interface ValidationOk {
   valid: true;
   /** EIP-55 checksummed EVM address extracted & normalised from the claim. */
-  normalizedEvmAddress: string;
+  normalizedEvmAddress: EvmAddressChecksummed;
   /** Parsed and validated claim from the Nostr event content. */
   claim: NostrBindingClaim;
 }
