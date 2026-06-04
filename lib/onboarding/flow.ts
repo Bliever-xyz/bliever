@@ -198,6 +198,11 @@ export async function runOnboarding(
     signMessage,
   });
 
+  // Zero the nsec immediately — Schnorr signing is complete and the raw key
+  // bytes are no longer needed. This prevents a heap-dump or GC-delay from
+  // exposing key material beyond the minimum required lifetime.
+  nsec.fill(0);
+
   // ── Step 7: Submit to backend ──────────────────────────────────────────
   // submitOnboarding throws OnboardingApiError on any non-2xx response.
   const serverResponse = await submitOnboarding({
@@ -293,6 +298,11 @@ export async function runBindIdentity(
     signMessage,
   });
 
+  // Zero the nsec — signing is complete. The caller (typically recoverNsec)
+  // passed ownership of these bytes here; zeroing prevents the key from
+  // persisting in RAM beyond its minimum required lifetime.
+  nsec.fill(0);
+
   // ── Step 4: Submit to backend ──────────────────────────────────────────
   const serverResponse = await submitBindIdentity({
     npub,
@@ -327,5 +337,5 @@ export async function runBindIdentity(
 
 export { OnboardingApiError } from "../api/client";
 export { recoverNsec, hasStoredNsec, clearStoredNsec } from "../crypto/nsec-storage";
-export { npubFromNsec } from "../nostr/keys";
+export { npubFromNsec, toHexNpub, toDisplayNpub } from "../nostr/keys";
 export { verifyIdentity } from "../api/client";
