@@ -5,7 +5,12 @@
  *
  * CLIENT-ONLY MODULE — requires browser WebSocket APIs.
  *
- * Publishes the signed Kind 30078 binding event to one or more Nostr relays.
+ * NIP-01 relay interactions: event publication and event subscription.
+ *
+ * ─── Publication ──────────────────────────────────────────────────────────────
+ *
+ * `publishEventToRelays` sends a fully signed event to one or more relays in
+ * parallel. Each relay gets its own independent timeout and retry budget.
  *
  * Design decisions:
  *
@@ -29,9 +34,23 @@
  *   Connection cleanup — each Relay connection is closed in the `finally`
  *   block regardless of outcome. No persistent WebSocket connections are kept
  *   open by this module.
+ *
+ * ─── Subscription / Reading ───────────────────────────────────────────────────
+ *
+ * `fetchNostrEvents` reads stored events from one or more relays using
+ * nostr-tools `SimplePool`. A pool manages multiple WebSocket connections
+ * concurrently, so slow or offline relays do not block delivery from the
+ * others.
+ *
+ * Every received event is cryptographically verified (id + Schnorr sig) before
+ * being returned. Malicious or malformed events are silently dropped.
+ *
+ * The pool is closed in a `finally` block to release all WebSocket connections
+ * once the EOSE (End of Stored Events) signal is received from each relay.
+ * No persistent connections are maintained by this module.
  */
 
-import { Relay } from "nostr-tools";
+import { Relay, SimplePool, verifyEvent, type Filter } from "nostr-tools";
 import type { NostrBindingEvent } from "../binding/schema";
 
 // ─── Result types ─────────────────────────────────────────────────────────────
@@ -211,4 +230,132 @@ export async function publishEventToRelays(
     outcomes,
     atLeastOneSuccess: outcomes.some((o) => o.success),
   };
+}
+
+// ─── Subscription / Reading ───────────────────────────────────────────────────
+
+/**
+ * NIP-01 filter parameters for `fetchNostrEvents`.
+ * Maps directly onto the NIP-01 REQ filter object.
+ */
+export interface FetchEventsParams {
+  /** WebSocket relay URLs to subscribe to (wss://…). */
+  relayUrls: string[];
+  /**
+   * Restrict results to events signed by these public keys (64-char hex).
+   * Omit to fetch events from all authors.
+   */
+  authors?: string[];
+  /**
+   * Restrict results to these event kinds (e.g. `[0]` for profiles,
+   * `[1]` for text notes, `[30078]` for binding events).
+   */
+  kinds?: number[];
+  /**
+   * Return only events created after this unix timestamp.
+   * Useful for incremental sync: pass the `created_at` of the newest
+   * locally-cached event to fetch only what is newer.
+   */
+  since?: number;
+  /**
+   * Return only events created before this unix timestamp.
+   * Useful for pagination: pass the `created_at` of the oldest event
+   * in the current page to fetch the next page back in time.
+   */
+  until?: number;
+  /**
+   * Maximum number of events to request per relay.
+   * Relays are not obligated to honour this exactly.
+   * @default 50
+   */
+  limit?: number;
+}
+
+/**
+ * Fetches stored Nostr events from one or more relays using `SimplePool`.
+ *
+ * A `SimplePool` manages multiple WebSocket connections concurrently, merging
+ * results across relays. This is the standard NIP-01 reading pattern:
+ * subscribing until the EOSE (End of Stored Events) signal is received, then
+ * closing the subscription.
+ *
+ * Every received event is cryptographically verified (event `id` integrity +
+ * Schnorr signature) before inclusion in the result. Events that fail
+ * verification are silently dropped with a console warning — a relay sending
+ * invalid events should not surface forged data to the application.
+ *
+ * The pool is fully closed in a `finally` block once EOSE is received from
+ * every subscribed relay. No persistent WebSocket connections remain open.
+ *
+ * Results are sorted newest-first (`created_at` descending).
+ *
+ * @param params - Filter parameters. All fields except `relayUrls` are optional.
+ * @returns       Verified events sorted newest-first. Empty array on error.
+ */
+export async function fetchNostrEvents(
+  params: FetchEventsParams,
+): Promise<NostrBindingEvent[]> {
+  const { relayUrls, authors, kinds, since, until, limit = 50 } = params;
+
+  if (relayUrls.length === 0) {
+    return [];
+  }
+
+  // Validate relay URLs up front — same logic as publishEventToRelays.
+  // Invalid URLs would cause SimplePool to throw or silently fail.
+  const validUrls = relayUrls.filter(isValidRelayUrl);
+  if (validUrls.length === 0) {
+    console.warn(
+      "[relay] fetchNostrEvents: no valid relay URLs provided (must be wss:// or ws://).",
+    );
+    return [];
+  }
+
+  const pool = new SimplePool();
+  const verified: NostrBindingEvent[] = [];
+
+  try {
+    // Build the NIP-01 REQ filter — omit undefined keys so the relay does
+    // not interpret them as empty-set constraints.
+    const filter: Filter = {
+      ...(authors && { authors }),
+      ...(kinds && { kinds }),
+      ...(since !== undefined && { since }),
+      ...(until !== undefined && { until }),
+      limit,
+    };
+
+    await new Promise<void>((resolve) => {
+      const sub = pool.subscribeMany(validUrls, [filter], {
+        onevent(event) {
+          // Cryptographically verify id and Schnorr sig before accepting.
+          // Relays should do this themselves, but a malicious relay could
+          // serve unsigned or tampered events.
+          if (verifyEvent(event)) {
+            // Cast is safe: NostrBindingEvent is structurally identical to
+            // the nostr-tools Event type (id, pubkey, kind, created_at,
+            // tags, content, sig).
+            verified.push(event as unknown as NostrBindingEvent);
+          } else {
+            console.warn("[relay] Dropped unverifiable event:", event.id);
+          }
+        },
+        oneose() {
+          // End of Stored Events — the relay has delivered all historical
+          // events matching the filter. Close the subscription and resolve.
+          sub.close();
+          resolve();
+        },
+      });
+    });
+
+    // Sort newest-first for consistent consumer behaviour.
+    return verified.sort((a, b) => b.created_at - a.created_at);
+  } catch (err) {
+    console.error("[relay] fetchNostrEvents error:", err);
+    return [];
+  } finally {
+    // Release all WebSocket connections regardless of outcome.
+    pool.close(validUrls);
+  }
 }
