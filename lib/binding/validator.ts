@@ -26,7 +26,7 @@ import {
   type EvmAddressChecksummed,
 } from "./schema";
 import { buildEVMConsentMessage } from "./message";
-import { verifyNostrEvent } from "../nostr/verification";
+import { verifyNostrEvent } from "../nostr/nip01-basic/verification";
 import { verifyEVMSignature, safeNormalizeAddress } from "../evm/verification";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
