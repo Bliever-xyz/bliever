@@ -198,7 +198,13 @@ async function prfCreateAndEncrypt(
       challenge: crypto.getRandomValues(new Uint8Array(32)),
       rp: { id: rpId, name: "Bliever" },
       user: {
-        id: userId,
+        // WebAuthn expects BufferSource (ArrayBuffer | ArrayBufferView<ArrayBuffer>).
+        // Uint8Array<ArrayBufferLike>.buffer is too broad for strict TS; the slice
+        // call materialises a fresh ArrayBuffer regardless of underlying buffer type.
+        id: userId.buffer.slice(
+          userId.byteOffset,
+          userId.byteOffset + userId.byteLength,
+        ) as ArrayBuffer,
         name: "bliever-user",
         displayName: "Bliever User",
       },
@@ -274,7 +280,14 @@ async function prfAssertAndDecrypt(
     publicKey: {
       challenge: crypto.getRandomValues(new Uint8Array(32)),
       rpId,
-      allowCredentials: [{ type: "public-key", id: rawId }],
+      allowCredentials: [{
+        type: "public-key",
+        // slice() produces a definite ArrayBuffer, satisfying WebAuthn's BufferSource.
+        id: rawId.buffer.slice(
+          rawId.byteOffset,
+          rawId.byteOffset + rawId.byteLength,
+        ) as ArrayBuffer,
+      }],
       userVerification: "preferred",
       extensions: {
         prf: { eval: { first: PRF_SALT } },
