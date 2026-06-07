@@ -30,20 +30,20 @@
  * ─── Dependency Graph ─────────────────────────────────────────────────────────
  *
  *   flow.ts
- *     ├── lib/nostr/keys.ts          (generateNostrKeypair, npubFromNsec)
- *     ├── lib/nostr/event.ts         (buildAndSignBindingEvent)
- *     ├── lib/nostr/relay.ts         (publishEventToRelays)
- *     ├── lib/crypto/nsec-storage.ts (persistNsec)
- *     ├── lib/binding/message.ts     (buildEVMConsentMessage)
- *     └── lib/api/client.ts          (submitOnboarding, submitBindIdentity)
+ *     ├── lib/nostr/nip01-basic/keys.ts   (generateNostrKeypair, npubFromNsec)
+ *     ├── lib/nostr/nip01-basic/event.ts  (buildAndSignBindingEvent)
+ *     ├── lib/nostr/nip01-basic/relay.ts  (publishEventToRelays)
+ *     ├── lib/crypto/nsec-storage.ts      (persistNsec)
+ *     ├── lib/binding/message.ts          (buildEVMConsentMessage)
+ *     └── lib/api/client.ts               (submitOnboarding, submitBindIdentity)
  *
  * External capabilities are injected as typed function parameters (SignMessageFn).
  * This keeps the module testable in isolation and decoupled from any UI framework.
  */
 
-import { generateNostrKeypair, npubFromNsec } from "../nostr/keys";
-import { buildAndSignBindingEvent } from "../nostr/event";
-import { publishEventToRelays, type PublishResult } from "../nostr/relay";
+import { generateNostrKeypair, npubFromNsec } from "../nostr/nip01-basic/keys";
+import { buildAndSignBindingEvent } from "../nostr/nip01-basic/event";
+import { publishEventToRelays, type PublishResult } from "../nostr/nip01-basic/relay";
 import { persistNsec } from "../crypto/nsec-storage";
 import { buildEVMConsentMessage } from "../binding/message";
 import { submitOnboarding, submitBindIdentity, OnboardingApiError } from "../api/client";
@@ -337,5 +337,5 @@ export async function runBindIdentity(
 
 export { OnboardingApiError } from "../api/client";
 export { recoverNsec, hasStoredNsec, clearStoredNsec } from "../crypto/nsec-storage";
-export { npubFromNsec, toHexNpub, toDisplayNpub } from "../nostr/keys";
+export { npubFromNsec, toHexNpub, toDisplayNpub } from "../nostr/nip01-basic/keys";
 export { verifyIdentity } from "../api/client";
