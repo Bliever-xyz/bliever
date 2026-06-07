@@ -13,7 +13,7 @@
  *   - If `address` is an EOA → recovers the signer via ecrecover and compares.
  *   - If `address` is a contract → calls `isValidSignature` via eth_call.
  *
- * The `client` parameter is required to enable the on-chain path.
+ * The `publicClient` parameter is required to enable the on-chain path.
  */
 
 import { verifyMessage, getAddress } from "viem";
@@ -58,9 +58,9 @@ export async function verifyEVMSignature(
 ): Promise<boolean> {
   try {
     return await verifyMessage({
-      // Providing `client` enables ERC-1271 on-chain verification.
+      // viem v2: `publicClient` enables ERC-1271 on-chain verification.
       // viem falls back to ecrecover for EOAs automatically.
-      client: basePublicClient,
+      publicClient: basePublicClient,
       address: expectedAddress as `0x${string}`,
       message,
       signature,
