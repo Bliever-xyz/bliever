@@ -59,7 +59,7 @@ import {
   fromBase64,
   toBase64Url,
   fromBase64Url,
-} from "../nostr/keys";
+} from "../nostr/nip01-basic/keys";
 import type { NsecStorageHandle, NsecStorageStrategy } from "../binding/schema";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -77,7 +77,7 @@ const NSEC_RECORD_KEY = "nsec_bundle";
  */
 const PRF_SALT: ArrayBuffer = new TextEncoder()
   .encode("bliever-v1:nsec-encryption-key-v1")
-  .buffer;
+  .buffer as ArrayBuffer;
 
 // ─── Internal record shape ────────────────────────────────────────────────────
 
@@ -154,7 +154,13 @@ async function aesgcmEncrypt(
   plaintext: Uint8Array,
 ): Promise<{ ciphertext: string; iv: string }> {
   const iv = crypto.getRandomValues(new Uint8Array(12)); // 96-bit GCM nonce
-  const buf = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext);
+  // Cast to ArrayBuffer: SubtleCrypto's BufferSource parameter requires ArrayBuffer
+  // in strict TypeScript; Uint8Array.buffer returns ArrayBufferLike which is too broad.
+  const buf = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: iv.buffer as ArrayBuffer },
+    key,
+    plaintext.buffer as ArrayBuffer,
+  );
   return { ciphertext: toBase64(new Uint8Array(buf)), iv: toBase64(iv) };
 }
 
@@ -163,10 +169,13 @@ async function aesgcmDecrypt(
   ciphertext: string,
   iv: string,
 ): Promise<Uint8Array> {
+  const ivBytes = fromBase64(iv);
+  const ctBytes = fromBase64(ciphertext);
+  // Cast to ArrayBuffer: SubtleCrypto requires ArrayBuffer, not ArrayBufferLike.
   const buf = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: fromBase64(iv) },
+    { name: "AES-GCM", iv: ivBytes.buffer as ArrayBuffer },
     key,
-    fromBase64(ciphertext),
+    ctBytes.buffer as ArrayBuffer,
   );
   return new Uint8Array(buf);
 }
