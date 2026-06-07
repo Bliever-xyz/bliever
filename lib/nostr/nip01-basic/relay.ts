@@ -318,19 +318,17 @@ export async function fetchNostrEvents(
   try {
     // Build the NIP-01 REQ filter — omit undefined keys so the relay does
     // not interpret them as empty-set constraints.
-    // `satisfies Filter` validates the shape at compile time; the explicit
-    // cast on subscribeMany resolves the index-signature narrowing that
-    // nostr-tools v2 requires for Filter[].
-    const filter = {
+    // nostr-tools 2.x SimplePool.subscribeMany accepts a single Filter object.
+    const filter: Filter = {
       ...(authors && { authors }),
       ...(kinds && { kinds }),
       ...(since !== undefined && { since }),
       ...(until !== undefined && { until }),
       limit,
-    } satisfies Filter;
+    };
 
     await new Promise<void>((resolve) => {
-      const sub = pool.subscribeMany(validUrls, [filter] as Filter[], {
+      const sub = pool.subscribeMany(validUrls, filter, {
         onevent(event) {
           // Cryptographically verify id and Schnorr sig before accepting.
           // Relays should do this themselves, but a malicious relay could
