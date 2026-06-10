@@ -1,4 +1,21 @@
-import { getAddress } from "viem";     
+/**
+ * lib/evm/verification.ts
+ *
+ * EVM-side cryptographic utilities for the binding system.
+ *
+ * Smart Account support
+ * ─────────────────────
+ * CDP ERC-4337 Smart Accounts sign messages via their underlying passkey or
+ * OAuth credential. The resulting signature is an ERC-1271 proof verified by
+ * calling `isValidSignature(bytes32 hash, bytes sig)` on the contract.
+ *
+ * viem v2 exposes actions as methods on the client instance.
+ * `basePublicClient.verifyMessage(...)` handles both paths automatically:
+ *   - If `address` is an EOA → recovers the signer via ecrecover and compares.
+ *   - If `address` is a contract → calls `isValidSignature` via eth_call.
+ */
+
+import { getAddress } from "viem";
 import { basePublicClient } from "./client";
 import type { HexString, EvmAddressChecksummed } from "../binding/schema";
 
@@ -6,6 +23,10 @@ import type { HexString, EvmAddressChecksummed } from "../binding/schema";
  * Returns the EIP-55 checksummed form of `address` as a branded
  * `EvmAddressChecksummed`, or `null` if the input is not a valid Ethereum
  * address.
+ *
+ * The branded return type ensures downstream callers work only with addresses
+ * that have passed through viem's checksum validation. Use this as the
+ * single entry point when normalising any externally-supplied EVM address.
  */
 export function safeNormalizeAddress(address: string): EvmAddressChecksummed | null {
   try {
@@ -19,8 +40,19 @@ export function safeNormalizeAddress(address: string): EvmAddressChecksummed | n
  * Verifies an EIP-191 personal_sign message against an expected address.
  *
  * Supports both:
- * - EOA wallets     (ecrecover path, no network call)
- * - ERC-1271 Smart Accounts (isValidSignature eth_call to Base RPC)
+ *   - EOA wallets         (ecrecover path, no network call)
+ *   - ERC-1271 Smart Accounts (isValidSignature eth_call to Base RPC)
+ *
+ * viem v2: actions are called as methods on the client instance.
+ * `basePublicClient.verifyMessage` natively handles both EOA recovery
+ * and ERC-1271 on-chain verification without additional configuration.
+ *
+ * Returns `false` on any error rather than throwing, so callers can use
+ * the result as a plain boolean guard.
+ *
+ * @param message          Plain-text string that was signed (pre-hash).
+ * @param signature        0x-prefixed hex EIP-191 signature.
+ * @param expectedAddress  EIP-55 checksummed address of the expected signer.
  */
 export async function verifyEVMSignature(
   message: string,
@@ -28,7 +60,7 @@ export async function verifyEVMSignature(
   expectedAddress: string,
 ): Promise<boolean> {
   try {
-    // Calling verifyMessage on the client invokes the Action, 
+    // Calling verifyMessage on the client invokes the Action,
     // which natively handles both EOA recovery and ERC-1271 verification.
     return await basePublicClient.verifyMessage({
       address: expectedAddress as `0x${string}`,
