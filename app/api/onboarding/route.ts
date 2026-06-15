@@ -22,8 +22,10 @@
  *   - Signing the EVM consent message via CDP signMessage hook.
  *
  * Server responsibilities (this file):
+ *   - Reject oversized payloads before any parsing (DoS guard).
  *   - Validate the incoming payload shape.
  *   - Delegate full dual-signature verification to validateBindingPayload.
+ *   - Emit structured log entries on validation failure for observability.
  *   - Return a structured response suitable for the indexer service.
  *
  * No data is persisted here. Persistence is the indexer's responsibility.
@@ -51,6 +53,7 @@
  * }
  *
  * 400 BindingErrorResponse  { success: false, reason: BindingErrorReason }
+ * 413 BindingErrorResponse  { success: false, reason: "invalid_payload"  }
  * 500 BindingErrorResponse  { success: false, reason: "internal_error"   }
  */
 
@@ -58,9 +61,24 @@ import { NextRequest, NextResponse } from "next/server";
 import type { OnboardingPayload, OnboardingResponse } from "@/lib/binding/schema";
 import { validateBindingPayload } from "@/lib/binding/validator";
 
+/** Maximum accepted Content-Length for binding payloads (8 KB). */
+const MAX_PAYLOAD_BYTES = 8_192;
+
 export async function POST(
   request: NextRequest,
 ): Promise<NextResponse<OnboardingResponse>> {
+  // ── 0. Payload size guard ─────────────────────────────────────────────────
+  // Reject oversized bodies before any JSON parsing. A well-formed binding
+  // payload is under 2 KB; 8 KB is generous while blocking CPU waste on
+  // deliberately large request bodies crafted to exploit JSON.parse cost.
+  const contentLength = Number(request.headers.get("content-length") ?? "0");
+  if (contentLength > MAX_PAYLOAD_BYTES) {
+    return NextResponse.json(
+      { success: false, reason: "invalid_payload" } as OnboardingResponse,
+      { status: 400 },
+    );
+  }
+
   // ── 1. Parse request body ─────────────────────────────────────────────────
   let payload: OnboardingPayload;
 
@@ -93,6 +111,13 @@ export async function POST(
     const result = await validateBindingPayload(payload);
 
     if (!result.valid) {
+      // Structured log: step-level visibility without exposing full npub/address.
+      console.error(JSON.stringify({
+        route: "onboarding",
+        reason: result.reason,
+        npub_prefix: payload.npub.slice(0, 8),
+        bindingId: payload.bindingId,
+      }));
       return NextResponse.json(
         { success: false, reason: result.reason } as OnboardingResponse,
         { status: 400 },
