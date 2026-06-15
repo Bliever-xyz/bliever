@@ -11,6 +11,8 @@
  *   • No retry logic — the orchestrator (`flow.ts`) decides retry strategy.
  *   • Rate-limit awareness — `OnboardingApiError` exposes `status` (HTTP code)
  *     so callers can distinguish 429 (back off) from 400 (fix the payload).
+ *   • Request timeout — every fetch is guarded by `AbortSignal.timeout` so
+ *     a hung server response cannot block the flow indefinitely.
  *
  * Base URL:
  *   Resolved from `NEXT_PUBLIC_API_BASE_URL` (Next.js public env var).
@@ -113,6 +115,15 @@ export class OnboardingApiError extends Error {
 const BASE_URL: string =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
 
+/**
+ * Per-request timeout in milliseconds.
+ * A hung server response (e.g. RPC provider hangs during ERC-1271 verification)
+ * would otherwise block the flow indefinitely. 15 seconds covers the ERC-1271
+ * RPC call under typical network conditions while providing a clear failure
+ * signal rather than an infinite wait.
+ */
+const REQUEST_TIMEOUT_MS = 15_000;
+
 async function postJson<TBody, TSuccess>(
   path: string,
   body: TBody,
@@ -123,9 +134,11 @@ async function postJson<TBody, TSuccess>(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch (networkErr) {
-    // fetch() itself can throw on network failure (offline, DNS failure).
+    // fetch() throws on network failure (offline, DNS failure) and on
+    // AbortError when REQUEST_TIMEOUT_MS is exceeded.
     throw new OnboardingApiError(
       `Network error calling ${path}: ${networkErr instanceof Error ? networkErr.message : String(networkErr)}`,
       "internal_error",
@@ -150,12 +163,43 @@ async function postJson<TBody, TSuccess>(
 // ─── Public endpoint functions ─────────────────────────────────────────────────
 
 /**
+ * Fetches the authoritative unix timestamp from GET /api/time.
+ *
+ * Used by `flow.ts` to generate binding coordinates after `persistNsec`
+ * completes, correcting for mobile clock drift that would otherwise cause
+ * immediate `timestamp_expired` failures on devices with inaccurate clocks.
+ *
+ * @throws if the network request fails or the response is malformed.
+ */
+export async function fetchServerTime(): Promise<number> {
+  let response: Response;
+  try {
+    response = await fetch(`${BASE_URL}/api/time`, {
+      method: "GET",
+      signal: AbortSignal.timeout(5_000),
+    });
+  } catch (networkErr) {
+    throw new Error(
+      `[api/client] fetchServerTime: network error: ${networkErr instanceof Error ? networkErr.message : String(networkErr)}`,
+    );
+  }
+  if (!response.ok) {
+    throw new Error(`[api/client] fetchServerTime: HTTP ${response.status}`);
+  }
+  const data = await response.json() as { now?: number };
+  if (typeof data.now !== "number") {
+    throw new Error("[api/client] fetchServerTime: response missing 'now' field.");
+  }
+  return data.now;
+}
+
+/**
  * Submits the completed dual-signature proof to POST /api/onboarding.
  *
  * Used during new-user registration. The server verifies both the Nostr
  * Schnorr signature and the EVM ERC-1271 signature before returning success.
  *
- * @throws `OnboardingApiError` on any non-2xx response.
+ * @throws `OnboardingApiError` on any non-2xx response or request timeout.
  */
 export async function submitOnboarding(
   payload: BindingPayload,
@@ -172,7 +216,7 @@ export async function submitOnboarding(
  * Used for re-link flows (Nostr key rotation, Smart Account migration).
  * Semantically identical to submitOnboarding but hits the re-link endpoint.
  *
- * @throws `OnboardingApiError` on any non-2xx response.
+ * @throws `OnboardingApiError` on any non-2xx response or request timeout.
  */
 export async function submitBindIdentity(
   payload: BindingPayload,
@@ -189,7 +233,7 @@ export async function submitBindIdentity(
  * Read-only and fast: no ERC-1271 RPC call on the server side.
  * Used before enabling SocialFi features on a user's profile.
  *
- * @throws `OnboardingApiError` on any non-2xx response.
+ * @throws `OnboardingApiError` on any non-2xx response or request timeout.
  */
 export async function verifyIdentity(
   payload: VerifyPayload,
