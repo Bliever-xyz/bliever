@@ -173,6 +173,10 @@ export function parseBindingClaim(content: string): ParseResult {
  *
  * The ERC-1271 call at step 9 is the only network-dependent step and is
  * intentionally last to minimise unnecessary RPC usage.
+ *
+ * Structured validation-failure logs are emitted via `console.error` on every
+ * non-success path. Log entries include the step number, reason code, and a
+ * short npub prefix for correlation. Full npub and evmAddress are never logged.
  */
 export async function validateBindingPayload(
   payload: BindIdentityPayload,
@@ -186,6 +190,21 @@ export async function validateBindingPayload(
     timestamp,
   } = payload;
 
+  const stepStart = Date.now();
+
+  /** Emit a structured log entry and return a ValidationFail. */
+  function fail(step: string, reason: BindingErrorReason): ValidationFail {
+    console.error(JSON.stringify({
+      module: "binding/validator",
+      step,
+      reason,
+      npub_prefix: typeof npub === "string" ? npub.slice(0, 8) : "unknown",
+      bindingId,
+      duration_ms: Date.now() - stepStart,
+    }));
+    return { valid: false, reason };
+  }
+
   // ── Timestamp redundancy note ─────────────────────────────────────────────
   // `timestamp` appears in three places: the top-level payload, the Nostr
   // event's `created_at`, and inside `NostrBindingClaim.timestamp` (content).
@@ -195,7 +214,7 @@ export async function validateBindingPayload(
 
   // 1. Timestamp freshness
   if (!checkTimestamp(timestamp)) {
-    return { valid: false, reason: "timestamp_expired" };
+    return fail("1:timestamp_freshness", "timestamp_expired");
   }
 
   // 1.5. created_at / timestamp cross-check
@@ -206,13 +225,13 @@ export async function validateBindingPayload(
   // message reconstruction — making two proofs from different moments appear
   // to form a valid binding.
   if (nostrEvent.created_at !== timestamp) {
-    return { valid: false, reason: "timestamp_expired" };
+    return fail("1.5:created_at_mismatch", "timestamp_expired");
   }
 
   // 2. Nostr event structure — kind, d-tag, tag presence and non-empty values
   const structureResult = checkNostrEventStructure(nostrEvent);
   if (!structureResult.ok) {
-    return { valid: false, reason: structureResult.reason };
+    return fail("2:event_structure", structureResult.reason);
   }
 
   // 2a. binding tag value must match the submitted bindingId.
@@ -221,14 +240,14 @@ export async function validateBindingPayload(
   // the Schnorr CPU step and the ERC-1271 RPC call.
   const bindingTagValue = nostrEvent.tags.find((t) => t[0] === "binding")?.[1]!;
   if (bindingTagValue !== bindingId) {
-    return { valid: false, reason: "binding_id_mismatch" };
+    return fail("2a:binding_tag_mismatch", "binding_id_mismatch");
   }
 
   // 2b. evm tag value must match the submitted evmAddress (case-insensitive;
   // exact EIP-55 checksum comparison happens at step 6).
   const evmTagValue = nostrEvent.tags.find((t) => t[0] === "evm")?.[1]!;
   if (evmTagValue.toLowerCase() !== evmAddress.toLowerCase()) {
-    return { valid: false, reason: "evm_address_mismatch" };
+    return fail("2b:evm_tag_mismatch", "evm_address_mismatch");
   }
 
   // 2.5. npub must be a 64-character lowercase hex string.
@@ -236,12 +255,12 @@ export async function validateBindingPayload(
   // fail the pubkey-match at step 3 with the misleading `nostr_pubkey_mismatch`
   // error. Catching the format problem here returns `invalid_payload` instead.
   if (!NPUB_HEX_REGEX.test(npub)) {
-    return { valid: false, reason: "invalid_payload" };
+    return fail("2.5:npub_format", "invalid_payload");
   }
 
   // 3. Nostr pubkey must match the supplied npub
   if (nostrEvent.pubkey !== npub) {
-    return { valid: false, reason: "nostr_pubkey_mismatch" };
+    return fail("3:pubkey_match", "nostr_pubkey_mismatch");
   }
 
   // 3.5. BindingId must be a syntactically valid UUID v4.
@@ -249,19 +268,19 @@ export async function validateBindingPayload(
   // because a malformed bindingId cannot match any claim content, so there
   // is no point advancing to the expensive operations.
   if (!UUID_V4_REGEX.test(bindingId)) {
-    return { valid: false, reason: "invalid_binding_id" };
+    return fail("3.5:binding_id_format", "invalid_binding_id");
   }
 
   // 4. Nostr Schnorr signature verification (CPU-only, no network)
   const nostrSigValid = await verifyNostrEvent(nostrEvent);
   if (!nostrSigValid) {
-    return { valid: false, reason: "invalid_nostr_signature" };
+    return fail("4:nostr_signature", "invalid_nostr_signature");
   }
 
   // 5. Parse embedded claim
   const parseResult = parseBindingClaim(nostrEvent.content);
   if ("error" in parseResult) {
-    return { valid: false, reason: parseResult.error };
+    return fail("5:claim_parse", parseResult.error);
   }
   const { claim } = parseResult;
 
@@ -270,17 +289,17 @@ export async function validateBindingPayload(
   const normalizedClaim = safeNormalizeAddress(claim.evmAddress);
 
   if (!normalizedExpected || !normalizedClaim) {
-    return { valid: false, reason: "evm_address_invalid" };
+    return fail("6:evm_address_normalise", "evm_address_invalid");
   }
 
   // 7. EVM address consistency
   if (normalizedClaim !== normalizedExpected) {
-    return { valid: false, reason: "evm_address_mismatch" };
+    return fail("7:evm_address_match", "evm_address_mismatch");
   }
 
   // 8. BindingId cross-field consistency
   if (claim.bindingId !== bindingId) {
-    return { valid: false, reason: "binding_id_mismatch" };
+    return fail("8:binding_id_cross_check", "binding_id_mismatch");
   }
 
   // 9. EVM consent signature – ERC-1271 on-chain call for Smart Accounts
@@ -291,7 +310,7 @@ export async function validateBindingPayload(
     normalizedExpected,
   );
   if (!evmSigValid) {
-    return { valid: false, reason: "invalid_evm_signature" };
+    return fail("9:evm_signature", "invalid_evm_signature");
   }
 
   return { valid: true, normalizedEvmAddress: normalizedExpected, claim };
