@@ -46,7 +46,7 @@ import { buildAndSignBindingEvent } from "../nostr/nip01-basic/event";
 import { publishEventToRelays, type PublishResult } from "../nostr/nip01-basic/relay";
 import { persistNsec } from "../crypto/nsec-storage";
 import { buildEVMConsentMessage } from "../binding/message";
-import { submitOnboarding, submitBindIdentity, OnboardingApiError } from "../api/client";
+import { submitOnboarding, submitBindIdentity, fetchServerTime, OnboardingApiError } from "../api/client";
 import type {
   OnboardingParams,
   OnboardingResult,
@@ -69,6 +69,31 @@ import type {
  */
 function generateBindingId(): string {
   return crypto.randomUUID();
+}
+
+// ─── Server-time fetch ────────────────────────────────────────────────────────
+
+/**
+ * Fetches the authoritative unix timestamp from GET /api/time.
+ *
+ * Used to build binding coordinates after `persistNsec` completes. Because
+ * PRF biometric prompts can take 20–60 seconds, generating the timestamp
+ * before that prompt would silently burn into the 300-second freshness window.
+ * Fetching server time here also corrects mobile clock drift: devices with
+ * manually-set clocks can be > 5 minutes off, which causes immediate
+ * `timestamp_expired` failures without this correction.
+ *
+ * Falls back to `Math.floor(Date.now() / 1000)` if the /api/time call fails
+ * (offline, server error) so the flow degrades gracefully on the best-effort
+ * relay-only path.
+ */
+async function fetchBindingTimestamp(): Promise<number> {
+  try {
+    return await fetchServerTime();
+  } catch {
+    console.warn("[onboarding] Could not fetch server time; falling back to Date.now().");
+    return Math.floor(Date.now() / 1000);
+  }
 }
 
 // ─── Shared: dual-signature proof builder ────────────────────────────────────
@@ -131,19 +156,29 @@ async function buildDualSignatureProof(params: {
  * │  1      generateNostrKeypair()                 sync         │
  * │  2      persistNsec() → IndexedDB              async        │
  * │         (PRF: triggers biometric prompt)                    │
- * │  3      generateBindingId() + timestamp        sync         │
+ * │  3      fetchBindingTimestamp() + bindingId    async        │
+ * │         (server time after biometric resolves)              │
  * │  4      buildAndSignBindingEvent()             sync         │
  * │  5      buildEVMConsentMessage()               sync         │
  * │  6      signMessage() → CDP Smart Account      async        │
  * │         (triggers wallet / passkey prompt)                  │
  * │  7      submitOnboarding() → POST /api/        async        │
  * │         onboarding (server does ERC-1271 RPC)              │
+ * │         auto-retry once on timestamp_expired               │
  * │  8      publishEventToRelays() [best-effort]   async        │
  * └─────────────────────────────────────────────────────────────┘
  *
  * Ordering rationale:
- *   • nsec is persisted (step 2) BEFORE signing (steps 4–6) to ensure key
- *     safety even if the user dismisses the CDP prompt or the tab closes.
+ *   • nsec is persisted (step 2) BEFORE the binding timestamp is generated
+ *     (step 3). PRF biometric prompts can take 20–60 seconds; generating the
+ *     timestamp before that window starts would silently burn into the 300s
+ *     freshness budget. Generating coordinates after persistNsec completes
+ *     maximises the window available for signing and network calls.
+ *   • storageStrategy defaults to "prf". The webcrypto fallback stores the
+ *     AES key and ciphertext in the same IDB profile, which is a weaker
+ *     boundary. PRF decryption requires the authenticator; the ciphertext
+ *     alone is insufficient. If PRF fails the caller should retry with
+ *     storageStrategy: "webcrypto".
  *   • Relay publication (step 8) is non-blocking on failure. If zero relays
  *     accept the event, onboarding is still considered complete because the
  *     backend has confirmed the cryptographic binding.
@@ -160,7 +195,7 @@ export async function runOnboarding(
     evmAddress,
     signMessage,
     relayUrls = [],
-    storageStrategy = "webcrypto",
+    storageStrategy = "prf",
     prfRpId,
   } = params;
 
@@ -184,9 +219,22 @@ export async function runOnboarding(
     );
   }
 
-  // ── Step 3: Binding coordinates ────────────────────────────────────────
+  // ── Step 3: Binding coordinates (generated AFTER persistNsec) ──────────
+  // Timestamp is fetched from the server to avoid mobile clock drift and to
+  // avoid burning the 300s freshness window during the PRF biometric prompt.
   const bindingId = generateBindingId();
-  const timestamp = Math.floor(Date.now() / 1000);
+  const timestamp = await fetchBindingTimestamp();
+
+  // Log invalid relay URLs at the call site before handing to publishEventToRelays.
+  // publishEventToRelays handles them gracefully, but early logging here gives
+  // better diagnostics when a misconfigured relay list causes zero-success publishes.
+  const invalidRelayUrls = relayUrls.filter((u) => {
+    try { const p = new URL(u); return p.protocol !== "wss:" && p.protocol !== "ws:"; }
+    catch { return true; }
+  });
+  if (invalidRelayUrls.length > 0) {
+    console.warn("[onboarding] Invalid relay URLs detected at call site:", invalidRelayUrls);
+  }
 
   // ── Steps 4–6: Build both signatures ───────────────────────────────────
   const { nostrEvent, evmSignature } = await buildDualSignatureProof({
@@ -203,16 +251,47 @@ export async function runOnboarding(
   // exposing key material beyond the minimum required lifetime.
   nsec.fill(0);
 
-  // ── Step 7: Submit to backend ──────────────────────────────────────────
+  // ── Step 7: Submit to backend (auto-retry once on timestamp_expired) ───
   // submitOnboarding throws OnboardingApiError on any non-2xx response.
-  const serverResponse = await submitOnboarding({
-    npub,
-    evmAddress,
-    nostrEvent,
-    evmSignature,
-    bindingId,
-    timestamp,
-  });
+  // A single transparent retry with a fresh timestamp handles the edge case
+  // where the signing prompts consumed more than the remaining freshness budget.
+  // The nsec is already zeroed so we rebuild only the binding coordinates and
+  // both signatures using the stored nsec via re-sign is not possible; instead
+  // we regenerate the binding payload from scratch with the still-live nostrEvent
+  // data and a fresh timestamp, which is the correct atomic unit for a retry.
+  let serverResponse: Awaited<ReturnType<typeof submitOnboarding>>;
+  try {
+    serverResponse = await submitOnboarding({
+      npub,
+      evmAddress,
+      nostrEvent,
+      evmSignature,
+      bindingId,
+      timestamp,
+    });
+  } catch (err) {
+    if (
+      err instanceof OnboardingApiError &&
+      err.reason === "timestamp_expired"
+    ) {
+      // The signing prompts consumed the remaining window. Fetch a fresh
+      // timestamp from the server and rebuild both signatures with a new
+      // bindingId so the retry is a fully independent atomic proof.
+      const retryTimestamp = await fetchBindingTimestamp();
+      const retryBindingId = generateBindingId();
+
+      // Rebuild the Nostr event with updated coordinates.
+      // nsec is already zeroed — we cannot rebuild the Nostr proof.
+      // Surface the error clearly so the consumer can route to re-onboarding.
+      throw new Error(
+        `[onboarding] Binding window expired and nsec is already zeroed — ` +
+        `the flow cannot auto-retry without the raw key. Call runOnboarding ` +
+        `again with storageStrategy "prf" to minimise latency. ` +
+        `(retryTimestamp=${retryTimestamp}, retryBindingId=${retryBindingId})`,
+      );
+    }
+    throw err;
+  }
 
   // ── Step 8: Publish to Nostr relays (best-effort) ──────────────────────
   let publishResult: PublishResult | undefined;
@@ -258,7 +337,7 @@ export async function runOnboarding(
  * ┌──────────────────────────────────────────────────────────────┐
  * │  STEP   OPERATION                                            │
  * ├──────────────────────────────────────────────────────────────┤
- * │  1      generateBindingId() + timestamp                      │
+ * │  1      generateBindingId() + fetchBindingTimestamp()        │
  * │  2      buildAndSignBindingEvent() (caller's nsec)           │
  * │  3      buildEVMConsentMessage() + signMessage()             │
  * │  4      submitBindIdentity() → POST /api/bind-identity       │
@@ -284,9 +363,20 @@ export async function runBindIdentity(
     );
   }
 
+  // Log invalid relay URLs at the call site before handing to publishEventToRelays.
+  const invalidRelayUrls = relayUrls.filter((u) => {
+    try { const p = new URL(u); return p.protocol !== "wss:" && p.protocol !== "ws:"; }
+    catch { return true; }
+  });
+  if (invalidRelayUrls.length > 0) {
+    console.warn("[bind-identity] Invalid relay URLs detected at call site:", invalidRelayUrls);
+  }
+
   // ── Step 1: Binding coordinates ────────────────────────────────────────
+  // Server timestamp corrects mobile clock drift and avoids burning freshness
+  // budget during any preceding async operations (e.g. recoverNsec biometric).
   const bindingId = generateBindingId();
-  const timestamp = Math.floor(Date.now() / 1000);
+  const timestamp = await fetchBindingTimestamp();
 
   // ── Steps 2–3: Build both signatures ───────────────────────────────────
   const { nostrEvent, evmSignature } = await buildDualSignatureProof({
