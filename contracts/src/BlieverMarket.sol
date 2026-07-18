@@ -908,10 +908,11 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
         // ── Effects ─────────────────────────────────────────────────────────
         resolved       = true;
         winningOutcome = outcomeCount;
-        // winningOutcome remains 0 (default) — no legitimate claim is possible
-        // since resolved=true with totalTraderShares[any] is still valid, but
-        // pool.settleMarket(0) means claimWinnings will always revert (amount=0 or
-        // PayoutExceedsSettlement). No trader funds are at risk.
+        // winningOutcome is set to outcomeCount as an explicit out-of-bounds sentinel value.
+        // Valid outcome indices are [0, outcomeCount), so this value can never be matched by
+        // claim() when it reads winningOutcome, ensuring no winning shares exist.
+        // pool.settleMarket(0) means claimWinnings will always revert (amount=0 hits ZeroAmount
+        // or PayoutExceedsSettlement with remaining=0). No trader funds are at risk.
 
         // ── Interaction: Settle with zero payout ─────────────────────────────
         IBlieverV1Pool(pool).settleMarket(0);
