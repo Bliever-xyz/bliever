@@ -81,11 +81,16 @@ interface IBlieverV1Pool {
     ///         via `usdcToken()` without storing a redundant copy.
     function asset() external view returns (address);
 
-    function alpha() external view returns (uint256);
+    /// @notice Register a prediction market with its own bespoke risk budget.
+    /// @dev    Guarded by MARKET_MANAGER_ROLE on the vault.
+    ///         `customMaxRisk` is supplied per-market by the factory rather than read
+    ///         from the vault's global `maxRiskPerMarket` storage slot, allowing each
+    ///         market to carry an independent worst-case loss ceiling.
+    ///
+    /// @param market        Address of the deployed market clone (must be a contract)
+    /// @param nOutcomes     Number of mutually exclusive outcomes (2–100)
+    /// @param customMaxRisk Per-market USDC loss budget (6-dec); stored as riskBudget
+    function registerMarket(address market, uint32 nOutcomes, uint256 customMaxRisk) external;
 
-    function maxRiskPerMarket() external view returns (uint256);
-
-    function registerMarket(address market, uint32 nOutcomes) external;
-    
     function deregisterMarket(address market) external;
 }
