@@ -368,8 +368,8 @@ contract BlieverV1Pool is
     ///
     ///         What happens internally
     ///         ───────────────────────
-    ///         1. Validates address (must be a contract), outcome count, and capacity check.
-    ///         2. Creates MarketInfo with riskBudget = maxRiskPerMarket.
+    ///         1. Validates address (must be a contract), outcome count, customMaxRisk, and capacity check.
+    ///         2. Creates MarketInfo with riskBudget = customMaxRisk (market-specific; set by factory).
     ///         3. Adds riskBudget to totalLiability (liability reserved immediately).
     ///         4. Grants MARKET_ROLE to the market contract address.
     ///
@@ -389,11 +389,15 @@ contract BlieverV1Pool is
     ///         Registration is accepted only when newTotalLiability ≤ active capital.
     ///         One mulDiv, one comparison — semantically complete.
     ///
-    /// @param market     Address of the market contract (must NOT be already registered)
-    /// @param nOutcomes  Number of mutually exclusive outcomes (2–100 inclusive)
+    /// @param market        Address of the market contract (must NOT be already registered)
+    /// @param nOutcomes     Number of mutually exclusive outcomes (2–100 inclusive)
+    /// @param customMaxRisk Per-market USDC loss budget supplied by the factory (6-dec).
+    ///                      Stored as riskBudget; fully independent of the vault's global
+    ///                      maxRiskPerMarket parameter.
     function registerMarket(
         address market,
-        uint32  nOutcomes
+        uint32  nOutcomes,
+        uint256 customMaxRisk
     ) external onlyRole(MARKET_MANAGER_ROLE) whenNotPaused {
         // ── Checks ──────────────────────────────────────────────────────────
         if (market   == address(0))           revert ZeroAddress();
@@ -401,9 +405,9 @@ contract BlieverV1Pool is
         if (nOutcomes < 2 || nOutcomes > 100) revert InvalidOutcomeCount(nOutcomes);
         if (markets[market].registered)        revert MarketAlreadyRegistered(market);
         if (activeMarketCount >= MAX_ACTIVE_MARKETS) revert ExceedsMaxMarkets(activeMarketCount);
+        if (customMaxRisk == 0)                revert InvalidMaxRisk(0);
 
-        uint256 risk         = maxRiskPerMarket;
-        uint256 newTotalLiab = totalLiability + risk;
+        uint256 newTotalLiab = totalLiability + customMaxRisk;
         uint256 assets       = totalAssets();
 
         // Active capital = assets × (100 % − reserveBps); liabilities must stay within it.
@@ -417,8 +421,8 @@ contract BlieverV1Pool is
             registered:       true,
             settled:          false,
             hasTrades:        false,
-            riskBudget:       risk,
-            currentLiability: risk,   // conservative: = C(q⁰) = R
+            riskBudget:       customMaxRisk,      // market-specific; set by factory at deployment
+            currentLiability: customMaxRisk,      // conservative: = C(q⁰) = R
             settledPayout:    0,
             claimedPayout:    0
         });
@@ -431,7 +435,7 @@ contract BlieverV1Pool is
 
         _grantRole(MARKET_ROLE, market);
 
-        emit MarketRegistered(market, nOutcomes, risk);
+        emit MarketRegistered(market, nOutcomes, customMaxRisk);
     }
 
     /// @notice Remove an unsettled market that has never received a trade.
