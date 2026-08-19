@@ -78,6 +78,21 @@ struct DeployParams {
     ///      Minimum value is enforced by the UMA Optimistic Oracle.
     uint256 liveness;
 
+    // ── Market-specific AMM parameters ────────────────────────────────────────
+    /// @dev LS-LMSR commission / spread parameter α for this market (18-dec fixed-point).
+    ///      Independent of the vault's global alpha setting; baked into this market's
+    ///      q⁰ seed and stored in the clone's own storage at initialization.
+    ///      Must be in [BlieverV1Pool.MIN_ALPHA, BlieverV1Pool.MAX_ALPHA] = [1e12, 2e17].
+    ///      Example: 3e16 = 3 % spread.
+    uint256 alpha;
+
+    /// @dev Per-market worst-case USDC loss budget (6-dec).
+    ///      Determines C(q⁰) = R for this market independently of the vault's global
+    ///      maxRiskPerMarket setting.  Stored as riskBudget in the pool's MarketInfo.
+    ///      Must be > 0; subject to the pool's live capacity check at registration time.
+    ///      Example: 1_000_000 = $1 USDC maximum vault loss for this market.
+    uint256 maxRisk;
+
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -122,9 +137,10 @@ struct DeployParams {
 ///         ─────────────────────────────────────────────────────────────────────────
 ///         EPSILON COMPUTATION
 ///         ─────────────────────────────────────────────────────────────────────────
-///         ε is computed on-chain from pool.alpha and pool.maxRiskPerMarket using the
-///         LS-LMSR seed formula: ε = R / (1 + α · n · ln n), where R is the vault's
-///         worst-case loss budget per market.  Natural-log values for n ∈ {2..7} are
+///         ε is computed on-chain from params.alpha and params.maxRisk — per-market
+///         values supplied in DeployParams — using the LS-LMSR seed formula:
+///         ε = R / (1 + α · n · ln n), where R = params.maxRisk (the market's
+///         individual worst-case loss budget).  Natural-log values for n ∈ {2..7} are
 ///         stored in a precomputed lookup table — no external math library required.
 ///         ε is never a caller-supplied input (prevents invalid seeds).
 ///
@@ -293,6 +309,9 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
     /// @dev computeEpsilon returned 0 — pool params may be misconfigured.
     error BlieverMarketFactory__ZeroEpsilon();
 
+    /// @dev params.alpha is outside [MIN_ALPHA, MAX_ALPHA] = [1e12, 2e17].
+    error BlieverMarketFactory__InvalidAlpha(uint256 value);
+
     /// @dev reward > 0 but rewardToken is the zero address.
     error BlieverMarketFactory__RewardTokenRequired();
 
@@ -379,17 +398,21 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
     ///         Execution steps (all-or-nothing — any revert cancels the entire transaction):
     ///         ─────────────────────────────────────────────────────────────────────────────
     ///         1. Validate all input parameters  (fail-fast, zero state mutations).
-    ///         2. Compute LS-LMSR ε from on-chain pool.alpha + pool.maxRiskPerMarket.
+    ///            Includes bounds-checking params.alpha and params.maxRisk.
+    ///         2. Compute LS-LMSR ε from params.alpha + params.maxRisk (per-market values).
     ///         3. Pull OO reward tokens from caller into factory  (if params.reward > 0).
     ///         4. Deploy EIP-1167 clone via CREATE2  (~41 k gas, deterministic address).
     ///         5. Initialize the clone  (sets resolver, factory, q-vector, deadlines, alpha).
-    ///         6. Register clone in BlieverV1Pool  (reserves riskBudget; grants MARKET_ROLE).
+    ///         6. Register clone in BlieverV1Pool  (reserves params.maxRisk as riskBudget; grants MARKET_ROLE).
     ///         7. Approve adapter then call adapter.initializeQuestion  (submits UMA OO request).
     ///         8. Record deployment in factory state; emit MarketDeployed.
     ///
     ///         ── Caller responsibilities ───────────────────────────────────────────
     ///         • Must hold OPERATOR_ROLE.
     ///         • Factory must NOT be paused.
+    ///         • params.alpha must be in [MIN_ALPHA, MAX_ALPHA] = [1e12, 2e17] (18-dec).
+    ///         • params.maxRisk must be > 0 (6-dec USDC) and must pass the pool's
+    ///           live capacity check: totalLiability + maxRisk ≤ activeCap.
     ///         • If params.reward > 0: BEFORE calling, approve THIS factory as spender
     ///           for ≥ params.reward of params.rewardToken.
     ///         • params.questionId must be correctly pre-computed off-chain:
@@ -440,6 +463,14 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
         if (params.reward > 0 && params.rewardToken == address(0))
             revert BlieverMarketFactory__RewardTokenRequired();
 
+        // Validate per-market AMM parameters.
+        // alpha bounds mirror BlieverV1Pool.MIN_ALPHA / MAX_ALPHA to guarantee the clone
+        // initialises with a valid liquidity parameter and that epsilon rounds to non-zero.
+        if (params.alpha < 1e12 || params.alpha > 2e17)
+            revert BlieverMarketFactory__InvalidAlpha(params.alpha);
+        if (params.maxRisk == 0)
+            revert BlieverMarketFactory__ZeroEpsilon(); // maxRisk=0 ⟹ epsilon=0 ⟹ degenerate market
+
         // Derive the CREATE2 salt deterministically from questionId.
         // This enforces a strict 1-to-1 bijection: one oracle question → one market address.
         // No operator can accidentally supply a duplicate or mismatched salt.
@@ -456,13 +487,12 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
                 revert BlieverMarketFactory__QuestionAlreadyDeployed(params.questionId, predicted);
         }
 
-        // ── 2. Read pool parameters once and compute ε ───────────────────────
-        // alpha_ and maxRisk are read once here to avoid redundant external calls.
-        // alpha_ is forwarded directly to market.initialize() so the clone receives
-        // the identical value that ε was computed for — guaranteeing C(q⁰) = maxRisk.
-        uint256 alpha_  = pool.alpha();
-        uint256 maxRisk = pool.maxRiskPerMarket();
-        uint256 epsilon = _computeEpsilon(params.nOutcomes, alpha_, maxRisk);
+        // ── 2. Compute ε from per-market parameters ───────────────────────────
+        // params.alpha and params.maxRisk are market-specific values supplied by the operator.
+        // They are independent of the vault's global alpha / maxRiskPerMarket storage slots.
+        // params.alpha is forwarded directly to market.initialize() so the clone stores the
+        // identical value that ε was computed for — guaranteeing C(q⁰) = params.maxRisk.
+        uint256 epsilon = _computeEpsilon(params.nOutcomes, params.alpha, params.maxRisk);
         if (epsilon == 0) revert BlieverMarketFactory__ZeroEpsilon();
 
         // ── 3. Pull reward tokens from caller ─────────────────────────────────
@@ -481,13 +511,14 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
         market = Clones.cloneDeterministic(implementation, salt);
 
         // ── 5. Initialize the clone ───────────────────────────────────────────
-        // alpha_ is the value read above — the same one used for ε.
-        // The clone sets its internal state: pool, resolver, factory, q-vector, deadlines.
+        // params.alpha is the per-market value supplied in DeployParams — the same one
+        // used for ε above.  The clone stores it in its own alpha slot so every
+        // trade executed against this clone uses the alpha it was seeded with.
         IDeployableMarket(market).initialize(
             address(pool),
             params.questionId,
             params.nOutcomes,
-            alpha_,                   // cached above — identical to epsilon's alpha
+            params.alpha,             // per-market alpha — identical to epsilon's alpha
             params.tradingDeadline,
             params.resolutionDeadline,
             epsilon,
@@ -496,10 +527,11 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
         );
 
         // ── 6. Register clone in BlieverV1Pool ───────────────────────────────
-        // registerMarket: (a) validates contract + capacity, (b) reserves riskBudget
-        // against totalLiability, (c) grants MARKET_ROLE to the clone.
+        // registerMarket: (a) validates contract + capacity, (b) reserves params.maxRisk
+        // as this market's riskBudget against totalLiability, (c) grants MARKET_ROLE.
+        // Each market carries its own bespoke riskBudget independent of the vault global.
         // Requires MARKET_MANAGER_ROLE on pool (must be pre-granted to this factory).
-        pool.registerMarket(market, uint32(params.nOutcomes));
+        pool.registerMarket(market, uint32(params.nOutcomes), params.maxRisk);
 
         // ── 7. Approve adapter and initialize oracle question ─────────────────
         // forceApprove resets any stale allowance to exactly params.reward — prevents
@@ -681,14 +713,15 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
         );
     }
 
-    /// @notice Compute the LS-LMSR epsilon (ε) seed quantity from current pool parameters.
+    /// @notice Compute the LS-LMSR epsilon (ε) seed quantity for a given set of
+    ///         per-market parameters.
     ///
     ///         ε seeds every outcome slot of the AMM's initial quantity vector q⁰ = [ε,...,ε].
     ///         The value is chosen so that the LS-LMSR cost function evaluates to:
     ///
-    ///             C(q⁰) = pool.maxRiskPerMarket  (in 18-dec USDC units)
+    ///             C(q⁰) = maxRisk  (expressed in 18-dec USDC units internally)
     ///
-    ///         establishing the vault's worst-case loss bound R from block 0.
+    ///         establishing the vault's worst-case loss bound R = maxRisk from block 0.
     ///
     ///         ── Formula derivation ──────────────────────────────────────────────
     ///         For any n-outcome LS-LMSR with liquidity parameter b = α·Σq_i = α·n·ε:
@@ -702,27 +735,35 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
     ///             ε  =  R / (1 + α·n·ln n)
     ///
     ///         where:
-    ///           R   = pool.maxRiskPerMarket × SHARE_TO_USDC  (6-dec → 18-dec)
-    ///           α   = pool.alpha                             (18-dec, e.g. 3e16 = 3%)
-    ///           n   = nOutcomes                              (integer ∈ [2, 7])
-    ///           lnN = _lnLookup(n)                          (18-dec precomputed exact value)
+    ///           R    = maxRisk × SHARE_TO_USDC  (6-dec → 18-dec)
+    ///           α    = alpha_                   (18-dec, e.g. 3e16 = 3%)
+    ///           n    = nOutcomes                (integer ∈ [2, 7])
+    ///           lnN  = _lnLookup(n)             (18-dec precomputed exact value)
     ///
-    ///         ── Why exposed as a public view ────────────────────────────────────
-    ///         Operators can call this off-chain before constructing a DeployParams to
-    ///         verify the ε that deployMarket will use.  Inside deployMarket the internal
-    ///         _computeEpsilon helper is used instead, with pool parameters cached once.
+    ///         ── Why exposed as a public pure view ───────────────────────────────
+    ///         Operators call this off-chain before constructing a DeployParams to
+    ///         verify the ε that deployMarket will use for any (alpha, maxRisk) combination.
+    ///         Because each market now carries its own parameters, the function accepts
+    ///         explicit inputs rather than reading from pool storage — making it a pure
+    ///         function that operators can query without any pool dependency.
     ///
     /// @param nOutcomes  Number of mutually exclusive outcomes [MIN_OUTCOMES, MAX_OUTCOMES]
+    /// @param alpha_     Per-market LS-LMSR α (18-dec, must be in [1e12, 2e17])
+    /// @param maxRisk    Per-market worst-case USDC loss budget (6-dec, must be > 0)
     /// @return epsilon   Initial per-outcome seed quantity (18-dec, LSMath scale)
-    function computeEpsilon(uint8 nOutcomes)
+    function computeEpsilon(uint8 nOutcomes, uint256 alpha_, uint256 maxRisk)
         public
-        view
+        pure
         returns (uint256 epsilon)
     {
         if (nOutcomes < MIN_OUTCOMES || nOutcomes > MAX_OUTCOMES)
             revert BlieverMarketFactory__InvalidOutcomeCount(nOutcomes);
+        if (alpha_ < 1e12 || alpha_ > 2e17)
+            revert BlieverMarketFactory__InvalidAlpha(alpha_);
+        if (maxRisk == 0)
+            revert BlieverMarketFactory__ZeroEpsilon();
 
-        epsilon = _computeEpsilon(nOutcomes, pool.alpha(), pool.maxRiskPerMarket());
+        epsilon = _computeEpsilon(nOutcomes, alpha_, maxRisk);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -738,9 +779,9 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
             revert BlieverMarketFactory__NotDeployedMarket(market);
     }
 
-    /// @dev Core LS-LMSR epsilon arithmetic.  Accepts pre-read pool parameters so that
-    ///      deployMarket can supply cached values (eliminating a redundant pool.alpha() call),
-    ///      while the public computeEpsilon view reads them fresh on every external call.
+    /// @dev Core LS-LMSR epsilon arithmetic.  Accepts per-market parameters so that both
+    ///      deployMarket (passing params.alpha / params.maxRisk directly) and the public
+    ///      computeEpsilon view (accepting explicit inputs) share one implementation.
     ///
     ///      Formula: ε = R / (1 + α·n·ln n)
     ///
@@ -749,8 +790,8 @@ contract BlieverMarketFactory is AccessControl, Pausable, ReentrancyGuard {
     ///        R18 * MATH_SCALE         ≤ 1e12 * 1e12 * 1e18 = 1e42 < 2^256 ✓
     ///
     /// @param nOutcomes  Pre-validated outcome count ∈ [2, 7]
-    /// @param alpha_     pool.alpha() in 18-dec fixed-point
-    /// @param maxRisk    pool.maxRiskPerMarket() in 6-dec USDC
+    /// @param alpha_     Per-market LS-LMSR α in 18-dec fixed-point
+    /// @param maxRisk    Per-market worst-case USDC loss budget in 6-dec USDC
     /// @return epsilon   ε in 18-dec fixed-point
     function _computeEpsilon(uint8 nOutcomes, uint256 alpha_, uint256 maxRisk)
         internal
