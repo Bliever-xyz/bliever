@@ -1117,21 +1117,21 @@ contract BlieverMarket is Initializable, ReentrancyGuardTransient, PausableUpgra
     /// @notice Compact market state summary for frontends and off-chain indexers.
     /// @return _resolved            True if oracle has resolved the market
     /// @return _winningOutcome      Winning outcome index (valid only when _resolved)
-    /// @return _tradingOpen         True if trading is currently permitted
+    /// @return tradingOpen_         True if trading is currently permitted
     /// @return _tradingDeadline_    Unix timestamp trading closes
     /// @return _resolutionDeadline_ Unix timestamp resolver must act by
     /// @return _totalVolumeShares   Sum of q-vector (total shares across all outcomes)
     function getMarketStatus() external view returns (
         bool    _resolved,
         uint8   _winningOutcome,
-        bool    _tradingOpen,
+        bool    tradingOpen_,
         uint40  _tradingDeadline_,
         uint40  _resolutionDeadline_,
         uint256 _totalVolumeShares
     ) {
         _resolved            = resolved;
         _winningOutcome      = winningOutcome;
-        _tradingOpen         = !resolved && block.timestamp < tradingDeadline;
+        tradingOpen_         = !resolved && block.timestamp < tradingDeadline;
         _tradingDeadline_    = tradingDeadline;
         _resolutionDeadline_ = resolutionDeadline;
 
